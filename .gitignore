@@ -4,9 +4,7 @@
 /openaddress-bevlg.csv
 
 # Local data dumps / anything the docker volumes spill into the tree.
-# data/sample.csv is the committed 5-row fixture for `import --csv`.
 /data/*
-!/data/sample.csv
 /docker/volumes/
 
 .env

@@ -385,9 +385,9 @@ final class ImportCommand extends Command
 
     /**
      * --csv/-f wins over CSV_PATH; relative paths are taken from the working
-     * directory, which is /app in the container, so `-f data/sample.csv` works.
+     * directory, which is /app in the container, so `-f data/addresses.csv` works.
      * The absolute form is what gets printed and put into every error message,
-     * because "not found: data/sample.csv" is not enough to debug a path.
+     * because "not found: data/addresses.csv" is not enough to debug a path.
      */
     private function resolveCsvPath(InputInterface $input): string
     {

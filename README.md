@@ -157,10 +157,10 @@ docker compose exec php php bin/console import \
 make import-addresses
 docker compose exec php php bin/console import --engine=all --level=all --recreate
 
-# From a different file. data/sample.csv is a 5-row fixture committed for exactly
-# this: it imports in under a second and produces 14 documents.
-docker compose exec php php bin/console import --engine=all --recreate -f data/sample.csv
-docker compose exec php php bin/console import --recreate --csv=/app/data/sample.csv
+# From a different file. Relative paths resolve against /app, absolute ones are
+# taken as given.
+docker compose exec php php bin/console import --engine=all --recreate -f data/other.csv
+docker compose exec php php bin/console import --recreate --csv=/app/data/other.csv
 ```
 
 The CSV is validated before anything destructive happens — a missing file, a directory, an
@@ -182,7 +182,7 @@ rather than adding a flag:
 ```bash
 docker compose exec \
   -e MYSQL_TABLE=scratch_suggestions -e ELASTICSEARCH_INDEX=scratch_suggestions \
-  php php bin/console import --engine=all --recreate -f data/sample.csv
+  php php bin/console import --engine=all --recreate --limit=200000
 ```
 
 ### `benchmark`
@@ -333,7 +333,6 @@ src/Http/                the JSON API
 public/                  front controller + the comparison UI
 sql/schema.sql           readable reference for the MySQL table
 benchmark/               query set and golden expectations
-data/sample.csv          5-row CSV fixture for `import --csv`
 docker/                  php, nginx and mysql configuration
 ```
 
