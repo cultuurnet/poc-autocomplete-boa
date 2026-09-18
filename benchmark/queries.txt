@@ -1,0 +1,178 @@
+# Benchmark query set for the MySQL vs Elasticsearch address autocomplete POC.
+#
+# One query per line. Blank lines and lines starting with '#' are ignored,
+# duplicates are dropped by the runner so no query is weighted twice in the
+# pooled latency aggregate.
+#
+# These are not random queries. Every section below is a case where the two
+# engines are expected to behave differently, because a query set where both
+# engines score the same tells you nothing. All names, postcodes and localities
+# are real and present in openaddress-bevlg.csv.
+
+# --- Progressive prefixes ---------------------------------------------------
+# What a type-ahead actually receives: one request per keystroke. The short
+# prefixes are the expensive ones (huge candidate sets, ranking decides
+# everything) and the long ones are the cheap ones. Latency on "g" and quality
+# on "goorbaan" are two different questions and both matter.
+g
+go
+goo
+goor
+goorb
+goorba
+goorbaa
+goorbaan
+k
+ke
+ker
+kerk
+kerks
+kerkstraat
+
+# --- Street plus municipality -----------------------------------------------
+# Two tokens that live in different fields of the same document. MySQL has to
+# match both against one FULLTEXT haystack; Elasticsearch can use a
+# cross_fields or multi_match. This is the bread-and-butter query shape.
+goorbaan herselt
+korte lindenstraat aalst
+wolterslaan gent
+bondgenotenlaan leuven
+veldstraat gent
+meir antwerpen
+lange violettestraat gent
+belgielei antwerpen
+boelenaar drongen
+antwerpsesteenweg hoboken
+brugse steenweg brugge
+brugsesteenweg gent
+
+# --- Street plus postcode ---------------------------------------------------
+# A numeric token next to a name. Tokenisers that drop or split digits, and
+# fuzzy matching that happily edits "2230" into "2233", both show up here.
+goorbaan 2230
+wolterslaan 9040
+kerkstraat 9050
+veldstraat 9000
+meir 2000
+bondgenotenlaan 3000
+stationsstraat 2230
+
+# --- Bare postcodes and postcode prefixes -----------------------------------
+# A bare postcode should return the postcode document first, not the 8000
+# addresses that contain it. Prefixes like "90" have no exact match at all and
+# test whether the engine falls back to prefix matching on the numeric field.
+9000
+2230
+9040
+2000
+8000
+3000
+90
+20
+900
+223
+
+# --- Bare municipality names ------------------------------------------------
+# The municipality document has to outrank every street and address in that
+# municipality, all of which also contain the municipality name in their
+# search text. Pure ranking problem, identical input for both engines.
+gent
+antwerpen
+brugge
+leuven
+hasselt
+herselt
+aalst
+sint-genesius-rode
+oud-heverlee
+
+# --- Sub-localities that are not municipalities ------------------------------
+# Drongen, Sint-Amandsberg and Hoboken are what people say; Gent and Antwerpen
+# are what the register calls them. They only exist as a postname on the
+# postcode document, so this tests whether the alias fields are searchable at
+# all rather than how they are ranked.
+drongen
+sint-amandsberg
+hoboken
+gentbrugge
+ramsel
+koolkerke
+'s-gravenwezel
+
+# --- Diacritics, apostrophes and hyphens ------------------------------------
+# Typed without the accent, because that is how people type. Both engines are
+# supposed to fold to the same string (Normalizer here, asciifolding there);
+# if they do not, this section is where it becomes visible.
+belgielei
+italielei
+brabanconnestraat
+lamorinierestraat
+hubert frere-orbanlaan
+frere orbanstraat
+onze-lieve-vrouwstraat leuven
+sint-genesius-rode
+oud-heverlee
+'s-gravenwezel
+
+# --- Typos ------------------------------------------------------------------
+# The section MySQL is expected to lose. FULLTEXT has no edit distance, so
+# unless the natural-language mode happens to stem its way to the right token
+# these return nothing at all, while Elasticsearch's fuzziness:AUTO should
+# recover most of them. A miss here is a user who gets an empty dropdown.
+antwrepen
+gnet
+brugse
+brugge steenweg
+goorban
+goorbann
+kerstraat
+kerkstraaat
+stationstraat
+wolterslan
+bondgenotelaan
+veldstrat
+herselt goorbaan
+oud heverlee
+sint genesius rode
+
+# --- Wrong word order -------------------------------------------------------
+# Users type what they remember first. Phrase matching punishes this; bag of
+# words does not. Worth knowing which behaviour each engine has by default.
+straat lange gent
+meer korte gent
+gent veldstraat
+leuven bondgenotenlaan
+2230 goorbaan
+herselt stationsstraat
+antwerpen meir
+
+# --- Very common street names -----------------------------------------------
+# The hardest ranking cases in the whole set. "Kerkstraat" exists in hundreds
+# of municipalities, so the top 10 is decided entirely by the popularity
+# signal and the tie-break, not by text relevance. Adding a city or a postcode
+# should collapse the candidate set immediately -- if it does not, the engine
+# is not using the second token properly.
+kerkstraat
+dorpsstraat
+stationsstraat
+schoolstraat
+molenstraat
+nieuwstraat
+kerkstraat gent
+kerkstraat antwerpen
+kerkstraat herselt
+dorpsstraat brugge
+dorpsstraat 8200
+stationsstraat aalst
+stationsstraat 9300
+schoolstraat gent
+molenstraat leuven
+
+# --- House-number level ------------------------------------------------------
+# Only meaningful after an --level=address or --level=all import. Left in on
+# purpose: against a street-level index they measure what each engine does with
+# a trailing numeric token it cannot resolve, which is itself a useful answer.
+goorbaan 59 herselt
+meir 1 antwerpen
+veldstraat 10 9000
+kerkstraat 2 gent

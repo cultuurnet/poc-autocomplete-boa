@@ -1,0 +1,167 @@
+{
+    "_readme": {
+        "what": "Curated ground truth for the MySQL vs Elasticsearch autocomplete POC. Each entry is a known-item query: there is one thing the user meant, and the engine either surfaced it or did not.",
+        "derived_from": "openaddress-bevlg.csv. Every id below was read out of the actual file (street_id, postcode, municipality_id / NIS), not invented. If the export is refreshed, re-derive them before trusting the scores.",
+        "id_format": {
+            "street": "street:{street_id}|{postcode}",
+            "address": "address:{address_id}",
+            "municipality": "municipality:{nis_code}",
+            "postcode": "postcode:{postcode}"
+        },
+        "matching_rule": "An expectation that starts with 'street:', 'address:', 'municipality:' or 'postcode:' is compared against the suggestion id, exactly. Anything else is compared case-insensitively as a substring of the suggestion label. Use an id when exactly one document is correct; use a label substring when a whole family of documents would be an acceptable answer.",
+        "expect_semantics": "The 'expect' list holds alternatives, not a set to retrieve in full: an entry counts as a hit at k when any expectation matches any of the top k suggestions. MRR uses the rank of the first matching suggestion.",
+        "index_level": "All expectations sit at street / municipality / postcode level, so the set scores correctly against a default `import --level=street` run. Nothing here needs the 4.2M address-level import."
+    },
+    "entries": [
+        {
+            "query": "goorbaan",
+            "expect": ["street:14602|2230"],
+            "note": "Baseline. A street name that is unique in Flanders, typed in full. If an engine cannot rank this first, nothing below matters."
+        },
+        {
+            "query": "goorb",
+            "expect": ["street:14602|2230"],
+            "note": "The same street at keystroke five. Tests prefix matching on the street name rather than whole-term matching, which is where a plain FULLTEXT index needs a wildcard or an explicit prefix column."
+        },
+        {
+            "query": "goorbaan herselt",
+            "expect": ["street:14602|2230"],
+            "note": "Street plus municipality: two tokens that live in different fields of the same document. Should narrow, not dilute."
+        },
+        {
+            "query": "goorbaan 2230",
+            "expect": ["street:14602|2230"],
+            "note": "Street plus postcode. The numeric token must be treated as a locality filter, not as a house number or as noise."
+        },
+        {
+            "query": "goorban",
+            "expect": ["street:14602|2230"],
+            "note": "One deleted character. MySQL FULLTEXT has no edit distance, so this is expected to return nothing; Elasticsearch with fuzziness AUTO should recover it. The clearest single quality difference in the set."
+        },
+        {
+            "query": "wolterslaan 9040",
+            "expect": ["street:72044|9040"],
+            "note": "One street_id (72044) spans postcodes 9040 and 9000, so there are two street documents. The postcode in the query has to pick the right one."
+        },
+        {
+            "query": "korte lindenstraat aalst",
+            "expect": ["street:61889|9300"],
+            "note": "Multi-word street name plus city. 'Korte' and 'Lindenstraat' are both common words on their own; only together with Aalst do they identify one street."
+        },
+        {
+            "query": "boelenaar drongen",
+            "expect": ["street:69749|9031"],
+            "note": "Drongen is a postname, not a municipality (the register says Gent). The street document only reaches it through the alias field, so this fails outright if aliases are not indexed."
+        },
+        {
+            "query": "bondgenotenlaan leuven",
+            "expect": ["street:34688|3000"],
+            "note": "The largest street in Leuven (1007 addresses). Also exists in Knokke-Heist and Landen, so popularity alone must not decide it."
+        },
+        {
+            "query": "veldstraat gent",
+            "expect": ["street:71854|9000"],
+            "note": "Veldstraat exists in dozens of municipalities and the Gent one is not the largest. Text relevance on the city token has to beat the popularity prior."
+        },
+        {
+            "query": "meer korte gent",
+            "expect": ["street:70770|9000"],
+            "note": "'Korte Meer' with the words reversed. Bag-of-words matching finds it, phrase matching does not."
+        },
+        {
+            "query": "onze-lieve-vrouwstraat leuven",
+            "expect": ["street:35160|3000"],
+            "note": "Hyphenated compound in 16 municipalities. Tests that both engines split on hyphens the same way and still prefer Leuven."
+        },
+        {
+            "query": "belgielei antwerpen",
+            "expect": ["street:294|2018"],
+            "note": "Stored as 'Belgielei' with a diaeresis, typed without one. Both engines must fold to the same string (Normalizer here, asciifolding there) or this misses on one side only."
+        },
+        {
+            "query": "brugse steenweg brugge",
+            "expect": ["street:44999|8000"],
+            "note": "Written as two words in Brugge but glued together in most other municipalities. Tests the spaced spelling against a corpus dominated by the glued one."
+        },
+        {
+            "query": "brugsesteenweg gent",
+            "expect": ["street:69811|9000", "street:69811|9030"],
+            "note": "The glued spelling. One street_id split over postcodes 9000 and 9030, both legitimately 'in Gent', so either document is a correct answer."
+        },
+        {
+            "query": "antwerpsesteenweg hoboken",
+            "expect": ["street:205|2660"],
+            "note": "Hoboken is a district of Antwerpen and exists only as the postname of 2660. Antwerpsesteenweg exists in 18 municipalities, so the alias is the only thing that disambiguates."
+        },
+        {
+            "query": "kerkstraat gent",
+            "expect": ["street:70662|9050"],
+            "note": "The hardest ranking case in the set. Kerkstraat exists in hundreds of municipalities, and the Gent one sits in postcode 9050 (Gentbrugge/Ledeberg) rather than 9000, so the city token must match through the municipality field and not the postname."
+        },
+        {
+            "query": "stationsstraat aalst",
+            "expect": ["street:62163|9300"],
+            "note": "Second of the three ubiquitous Flemish street names. Same shape as the Kerkstraat case but with a postcode whose postname equals the municipality, so it should be easier -- if it is not, the difference is informative."
+        },
+        {
+            "query": "meir antwerpen",
+            "expect": ["street:1992|2000"],
+            "note": "Four-letter street name. Short terms are where prefix matching, minimum term length (MySQL ft_min_word_len) and fuzziness thresholds all interact badly."
+        },
+        {
+            "query": "gent",
+            "expect": ["municipality:44021"],
+            "note": "A bare city name must return the municipality document, not one of the 167k Gent addresses or streets that all contain 'gent' in their search text. Pure type-priority ranking."
+        },
+        {
+            "query": "gnet",
+            "expect": ["municipality:44021", "postcode:9000"],
+            "note": "Transposed characters in a four-letter word. Short strings are exactly where fuzzy matching either saves you or produces garbage; either the municipality or the postcode document is an acceptable answer."
+        },
+        {
+            "query": "antwrepen",
+            "expect": ["municipality:11002", "postcode:2000"],
+            "note": "Transposition in the largest municipality in the data (344k addresses). The correct answer is also the most popular document, so an engine that recovers the typo at all should rank it first."
+        },
+        {
+            "query": "sint-genesius-rode",
+            "expect": ["municipality:23101", "postcode:1640"],
+            "note": "Triple-hyphenated name, and one of the few municipalities in the Flemish export whose French name (Rhode-Saint-Genese) is also populated. Tests hyphen handling and the FR alias at once."
+        },
+        {
+            "query": "oud-heverlee",
+            "expect": ["municipality:24086", "postcode:3050"],
+            "note": "Hyphenated municipality where the first part, 'oud', is also a common word inside other street names. The municipality document must still win."
+        },
+        {
+            "query": "9040",
+            "expect": ["postcode:9040"],
+            "note": "A bare postcode must return the postcode document, not the 13k addresses carrying it. The postcode document's label is '9040 Sint-Amandsberg' because that postcode maps to exactly one sub-locality."
+        },
+        {
+            "query": "sint-amandsberg",
+            "expect": ["postcode:9040"],
+            "note": "The name people actually use for 9040; the register calls it Gent. There is no municipality document for Sint-Amandsberg, so the postcode document is the only correct answer."
+        },
+        {
+            "query": "drongen",
+            "expect": ["postcode:9031"],
+            "note": "Same shape as Sint-Amandsberg but a much smaller postcode (6.5k addresses), so the popularity prior works against the correct answer here."
+        },
+        {
+            "query": "hoboken",
+            "expect": ["postcode:2660"],
+            "note": "Antwerpen district, 20k addresses. Together with drongen this brackets the popularity range for sub-locality lookups."
+        },
+        {
+            "query": "'s-gravenwezel",
+            "expect": ["postcode:2970"],
+            "note": "Leading apostrophe plus hyphen, and the register stores it as \"'S Gravenwezel/SCHILDE\", so the label shown is '2970 Schilde' and the match can only come from the alias. Worst-case punctuation in the whole data set."
+        },
+        {
+            "query": "kerkstraat",
+            "expect": ["Kerkstraat,"],
+            "note": "Label-substring expectation rather than an id: with hundreds of Kerkstraten and no second token, any Kerkstraat is a defensible top hit. What is being checked is that the engine returns a street named Kerkstraat first, and not a municipality, a postcode, or a street that merely contains the word."
+        }
+    ]
+}
