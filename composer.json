@@ -1,0 +1,28 @@
+{
+    "name": "publiq/poc-autocomplete",
+    "description": "POC: address autocomplete on the Belgian address register, MySQL vs Elasticsearch 8",
+    "type": "project",
+    "license": "proprietary",
+    "require": {
+        "php": ">=8.3",
+        "ext-json": "*",
+        "ext-mbstring": "*",
+        "ext-pdo": "*",
+        "elasticsearch/elasticsearch": "^8.15",
+        "guzzlehttp/guzzle": "^7.8",
+        "symfony/console": "^7.1"
+    },
+    "autoload": {
+        "psr-4": {
+            "App\\": "src/"
+        }
+    },
+    "config": {
+        "sort-packages": true,
+        "allow-plugins": {
+            "php-http/discovery": true
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

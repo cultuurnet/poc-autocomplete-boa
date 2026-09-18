@@ -1,0 +1,2 @@
+- How do places rank in importance vs addresses? Do we do a lookup on address for UDB places as well?
+- Should we index on the label of house numbers?

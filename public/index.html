@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Address autocomplete: MySQL vs Elasticsearch</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+
+<header class="top">
+  <div class="top-row">
+    <h1>Address autocomplete <span class="sub">MySQL 8.4 vs Elasticsearch 8.19, identical data</span></h1>
+    <div class="health" id="health" aria-live="polite">
+      <span class="health-item is-unknown">checking engines&hellip;</span>
+    </div>
+  </div>
+
+  <div class="search">
+    <input
+      id="q"
+      type="search"
+      autocomplete="off"
+      autocapitalize="off"
+      spellcheck="false"
+      placeholder="Type a street, municipality or postcode&hellip;"
+      aria-label="Search query">
+    <span class="hint" id="status" aria-live="polite"></span>
+  </div>
+
+  <div class="controls">
+    <label class="control">
+      <span>Limit</span>
+      <select id="limit">
+        <option value="5">5</option>
+        <option value="10" selected>10</option>
+        <option value="20">20</option>
+        <option value="50">50</option>
+      </select>
+    </label>
+
+    <label class="control control-check">
+      <input type="checkbox" id="fuzzy" checked>
+      <span>Fuzzy</span>
+    </label>
+
+    <fieldset class="control control-types">
+      <legend>Types</legend>
+      <label><input type="checkbox" class="type" value="address" checked><span>address</span></label>
+      <label><input type="checkbox" class="type" value="street" checked><span>street</span></label>
+      <label><input type="checkbox" class="type" value="municipality" checked><span>municipality</span></label>
+      <label><input type="checkbox" class="type" value="postcode" checked><span>postcode</span></label>
+    </fieldset>
+
+    <p class="keys">
+      <kbd>&larr;</kbd><kbd>&rarr;</kbd> column &middot;
+      <kbd>&uarr;</kbd><kbd>&darr;</kbd> move &middot;
+      <kbd>Enter</kbd> pin &middot;
+      <kbd>Esc</kbd> clear
+    </p>
+  </div>
+
+  <div class="trend" id="trend"></div>
+</header>
+
+<main class="columns" id="columns">
+  <section class="column" data-engine="mysql" tabindex="-1">
+    <header class="column-head">
+      <h2>MySQL</h2>
+      <span class="fastest" hidden>fastest</span>
+      <dl class="stats">
+        <div><dt>engine</dt><dd class="stat-server">&ndash;</dd></div>
+        <div><dt>round-trip</dt><dd class="stat-client">&ndash;</dd></div>
+        <div><dt>results</dt><dd class="stat-count">&ndash;</dd></div>
+      </dl>
+    </header>
+    <p class="engine-error" hidden></p>
+    <ol class="results"></ol>
+    <p class="empty" hidden>No results.</p>
+  </section>
+
+  <section class="column" data-engine="elasticsearch" tabindex="-1">
+    <header class="column-head">
+      <h2>Elasticsearch</h2>
+      <span class="fastest" hidden>fastest</span>
+      <dl class="stats">
+        <div><dt>engine</dt><dd class="stat-server">&ndash;</dd></div>
+        <div><dt>round-trip</dt><dd class="stat-client">&ndash;</dd></div>
+        <div><dt>results</dt><dd class="stat-count">&ndash;</dd></div>
+      </dl>
+    </header>
+    <p class="engine-error" hidden></p>
+    <ol class="results"></ol>
+    <p class="empty" hidden>No results.</p>
+  </section>
+</main>
+
+<aside class="pinned" id="pinned" hidden>
+  <header>
+    <h2>Pinned result</h2>
+    <button type="button" id="unpin">close</button>
+  </header>
+  <div id="pinned-body"></div>
+</aside>
+
+<script src="app.js"></script>
+</body>
+</html>

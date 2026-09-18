@@ -1,0 +1,14 @@
+.git
+.gitignore
+.idea
+.DS_Store
+
+vendor
+
+# 620 MB. It is bind-mounted into the container at runtime and must never be
+# sent to the daemon as part of the build context.
+openaddress-bevlg.csv
+*.csv
+data/
+
+.env

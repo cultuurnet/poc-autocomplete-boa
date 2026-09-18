@@ -1,0 +1,40 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use App\Command\BenchmarkCommand;
+use App\Command\HealthCommand;
+use App\Command\ImportCommand;
+use App\Container;
+use Symfony\Component\Console\Application;
+
+// The address-level import streams 4.2M CSV rows while holding an 83k-entry
+// aggregate table in memory, and a full two-engine import runs for well over
+// the default max_execution_time. Neither limit protects anything here: this is
+// a batch CLI, not a web request.
+ini_set('memory_limit', '-1');
+set_time_limit(0);
+
+$autoload = __DIR__ . '/../vendor/autoload.php';
+
+if (!is_file($autoload)) {
+    fwrite(STDERR, "Dependencies are not installed (vendor/ is missing).\n");
+    fwrite(STDERR, "run: make install\n");
+
+    exit(1);
+}
+
+require $autoload;
+
+// One container for all three commands: the PDO connection and the
+// Elasticsearch client are built lazily, so `health` on a half-dead stack still
+// gets far enough to tell you which half is dead.
+$container = new Container();
+
+$application = new Application('poc-autocomplete: MySQL vs Elasticsearch address autocomplete', '1.0.0');
+$application->add(new ImportCommand($container));
+$application->add(new BenchmarkCommand($container));
+$application->add(new HealthCommand($container));
+
+exit($application->run());
