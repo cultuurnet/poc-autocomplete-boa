@@ -54,7 +54,7 @@ import: require-csv ## Import into both engines (needs CSV=path; ARGS="--limit=1
 import-mysql: require-csv ## Import into MySQL only (needs CSV=path)
 	$(DC) exec php php bin/console import --engine=mysql --recreate $(CSV_ARG) $(ARGS)
 
-import-es: require-·csv ## Import into Elasticsearch only (needs CSV=path)
+import-es: require-csv ## Import into Elasticsearch only (needs CSV=path)
 	$(DC) exec php php bin/console import --engine=elasticsearch --recreate $(CSV_ARG) $(ARGS)
 
 import-addresses: require-csv ## Import down to house-number level, 4.2M docs (needs CSV=path)
