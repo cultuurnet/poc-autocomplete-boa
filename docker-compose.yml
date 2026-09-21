@@ -5,10 +5,10 @@ services:
       dockerfile: docker/php/Dockerfile
     working_dir: /app
     volumes:
+      # The whole project root, so the 620 MB source CSV is readable at
+      # /app/<name>.csv without copying it into the image.
       - ./:/app
     environment:
-      # The 620 MB source file lives in the project root, which is mounted at /app.
-      CSV_PATH: /app/openaddress-bevlg.csv
       MYSQL_HOST: mysql
       MYSQL_PORT: "3306"
       MYSQL_DATABASE: autocomplete

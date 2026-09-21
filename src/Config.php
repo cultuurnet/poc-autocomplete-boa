@@ -11,7 +11,7 @@ namespace App;
  */
 final class Config
 {
-    public readonly string $csvPath;
+    public readonly ?string $csvPath;
     public readonly string $mysqlHost;
     public readonly int $mysqlPort;
     public readonly string $mysqlDatabase;
@@ -23,9 +23,11 @@ final class Config
 
     public function __construct()
     {
-        // Resolves to /app/openaddress-bevlg.csv in the container and to the project
-        // root on the host, so the CLI works either way without env juggling.
-        $this->csvPath = self::env('CSV_PATH', dirname(__DIR__) . '/openaddress-bevlg.csv');
+        // No default. Which extract to load is a per-run choice, so it is a CLI
+        // option (--csv/-f); CSV_PATH only pins it for an environment that always
+        // reads the same file. Guessing a filename here just moved the failure to
+        // the first fopen, and made "which file did it even try?" a code question.
+        $this->csvPath = self::envOrNull('CSV_PATH');
         $this->mysqlHost = self::env('MYSQL_HOST', '127.0.0.1');
         $this->mysqlPort = (int) self::env('MYSQL_PORT', '3306');
         $this->mysqlDatabase = self::env('MYSQL_DATABASE', 'autocomplete');
@@ -48,8 +50,13 @@ final class Config
 
     private static function env(string $key, string $default): string
     {
+        return self::envOrNull($key) ?? $default;
+    }
+
+    private static function envOrNull(string $key): ?string
+    {
         $value = getenv($key);
 
-        return $value === false || $value === '' ? $default : $value;
+        return $value === false || $value === '' ? null : $value;
     }
 }

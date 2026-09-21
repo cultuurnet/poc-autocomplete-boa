@@ -19,7 +19,8 @@ runs in Docker.
 - **Docker** with Compose v2 (`docker compose`, not `docker-compose`). The stack wants ~2 GB
   of RAM free: Elasticsearch is pinned to a 1 GB heap and MySQL to a 1 GB buffer pool, both
   deliberately, so the benchmark measures the engines rather than swapping.
-- **`openaddress-bevlg.csv` in the project root.** It is 591 MiB and **not in git**. Download
+- **An address CSV.** There is no default filename — every import names its file with
+  `--csv/-f`, or `make import CSV=...`. The file below is 591 MiB and **not in git**. Download
   the combined Belgian address export from
   <https://data.gov.be/nl/datasets/fpsbosa-dis-best-csv-deriv> — the `BE-VLG` (Flanders)
   extract is the file this POC reads. The export is refreshed weekly; any recent copy works
@@ -32,16 +33,16 @@ No PHP or Composer on the host: everything runs inside the `php` container.
 ## Setup from zero
 
 ```
-make up        # build the php image, start mysql + es + nginx, wait for healthy, composer install
-make import    # street + municipality + postcode documents into both engines
-make health    # confirm both engines hold the same document count
+make up                                  # build the php image, start mysql + es + nginx, wait for healthy, composer install
+make import CSV=openaddress-bevlg.csv    # street + municipality + postcode documents into both engines
+make health                              # confirm both engines hold the same document count
 open http://localhost:8080
 ```
 
 | Step | What it does | How long |
 |---|---|---|
 | `make up` | Builds the PHP image, pulls MySQL 8.4 and Elasticsearch 8.19.12, starts all four containers, blocks until their healthchecks pass, then runs `composer install` if `vendor/` is missing | Several minutes cold (image pulls dominate); **~4 s** warm |
-| `make import` | One pass over the 591 MiB CSV, aggregating it into 82,643 documents, written to both engines | **~38 s** |
+| `make import CSV=...` | One pass over the 591 MiB CSV, aggregating it into 82,643 documents, written to both engines. `CSV=` is required — there is no default filename | **~38 s** |
 | `make health` | Reads the configured paths and asks both engines for a document count | < 1 s |
 
 `make up` is idempotent and is the only command needed to spin the stack up — rerunning it on
@@ -94,14 +95,16 @@ Everything lives behind `bin/console` inside the `php` container. Two equivalent
 it:
 
 ```
-make import ARGS="--limit=200000"                                   # via make
-docker compose exec php php bin/console import --limit=200000       # raw
+make import CSV=openaddress-bevlg.csv ARGS="--limit=200000"            # via make
+docker compose exec php php bin/console import \
+  -f openaddress-bevlg.csv --limit=200000                              # raw
 ```
 
 The Makefile only wraps the combinations that get used often, and each wrapper hard-codes some
 flags (`make import` always passes `--engine=all --recreate`). **`ARGS="..."` appends to that**,
-it does not replace it. Anything the Makefile does not cover — `--level=address`, `--csv`,
-`--postcode`, an import *without* `--recreate` — use the raw form.
+it does not replace it. The file to read is always named explicitly, as `CSV=` via make or
+`--csv/-f` raw. Anything the Makefile does not cover — `--level=address`, `--postcode`, an
+import *without* `--recreate` — use the raw form.
 
 Global flags from Symfony Console apply to every command: `-h/--help`, `-v`/`-vv`/`-vvv`,
 `-q/--quiet`, `--silent`, `--no-ansi`, `-n/--no-interaction`, `-V/--version`.
@@ -118,7 +121,7 @@ Loads the register into MySQL and/or Elasticsearch from a single CSV pass.
 | `--limit` | integer | none | Stop after N *usable* CSV rows (rows failing the status/postcode/coordinate checks are not counted). |
 | `--postcode` | e.g. `2230`, repeatable | all | Keep only these postcodes. Still reads the whole file. |
 | `--recreate` | flag | off | Drop and rebuild the table / index before writing. Without it, documents are upserted into whatever is already there. |
-| `-f`, `--csv` | path | `CSV_PATH` env, falling back to `<project>/openaddress-bevlg.csv` | Import from a different file. Relative paths resolve against the working directory, which is `/app` in the container. |
+| `-f`, `--csv` | path | `CSV_PATH` env, otherwise **required** | Which file to import. Relative paths resolve against the working directory, which is `/app` in the container — the project root is mounted there, so any file under it works. Via make: `make import CSV=data/other.csv`. |
 
 `--level` in terms of what it costs:
 
@@ -134,32 +137,35 @@ Only `street` is the level the endpoint would actually serve. `address` is a loa
 
 ```bash
 # Full street-level import into both engines, from scratch. The normal case.
-make import
-docker compose exec php php bin/console import --engine=all --recreate
+make import CSV=openaddress-bevlg.csv
+docker compose exec php php bin/console import --engine=all --recreate -f openaddress-bevlg.csv
 
 # Quick partial import for iterating: first 200k usable rows.
 # ~8 s, 50,988 documents (50,268 streets, 266 municipalities, 454 postcodes).
-make import ARGS="--limit=200000"
-docker compose exec php php bin/console import --engine=all --recreate --limit=200000
+make import CSV=openaddress-bevlg.csv ARGS="--limit=200000"
+docker compose exec php php bin/console import --engine=all --recreate \
+  -f openaddress-bevlg.csv --limit=200000
 
 # One engine only -- useful when you are changing that engine's mapping or schema
 # and do not want to wait for the other.
-make import-mysql
-make import-es
-docker compose exec php php bin/console import --engine=elasticsearch --recreate
+make import-mysql CSV=openaddress-bevlg.csv
+make import-es CSV=openaddress-bevlg.csv
+docker compose exec php php bin/console import --engine=elasticsearch --recreate \
+  -f openaddress-bevlg.csv
 
 # One municipality's postcodes. Still scans the whole file (~21 s) because the
 # filter is applied per row, but produces a 573-document index you can eyeball.
 docker compose exec php php bin/console import \
-  --engine=all --recreate --postcode=2230 --postcode=2260
+  --engine=all --recreate -f openaddress-bevlg.csv --postcode=2230 --postcode=2260
 
 # House-number level, ~3.9M documents. Slow, and the point of the exercise.
-make import-addresses
-docker compose exec php php bin/console import --engine=all --level=all --recreate
+make import-addresses CSV=openaddress-bevlg.csv
+docker compose exec php php bin/console import --engine=all --level=all --recreate \
+  -f openaddress-bevlg.csv
 
-# From a different file. Relative paths resolve against /app, absolute ones are
-# taken as given.
-docker compose exec php php bin/console import --engine=all --recreate -f data/other.csv
+# Any other file. Relative paths resolve against /app, absolute ones are taken
+# as given. The filename carries no meaning; only the header has to match.
+make import CSV=data/other.csv
 docker compose exec php php bin/console import --recreate --csv=/app/data/other.csv
 ```
 
@@ -172,8 +178,6 @@ $ docker compose exec php php bin/console import -f data/nope.csv --recreate
 
  [ERROR] CSV file not found: data/nope.csv
          Relative paths resolve against /app (the project root inside the container).
-         Either pass an existing file with --csv/-f, or put openaddress-bevlg.csv in the
-         project root.
 ```
 
 To import into a throwaway table and index instead of the real ones, override the environment
@@ -182,7 +186,7 @@ rather than adding a flag:
 ```bash
 docker compose exec \
   -e MYSQL_TABLE=scratch_suggestions -e ELASTICSEARCH_INDEX=scratch_suggestions \
-  php php bin/console import --engine=all --recreate --limit=200000
+  php php bin/console import --engine=all --recreate -f openaddress-bevlg.csv --limit=200000
 ```
 
 ### `benchmark`
@@ -213,7 +217,11 @@ cuts that to 1,484 and finishes in a few seconds.
 
 ### `health`
 
-No options. Prints the resolved configuration (hosts, table, index, CSV path and whether the
+| Option | Values | Default | What it does |
+|---|---|---|---|
+| `-f`, `--csv` | path | `CSV_PATH` env, otherwise unset | Report on this file. Resolved exactly as `import` resolves it, so the readability line describes the file an import would actually read. Unset is not a failure — the CSV row reads `not set`, and only the engines decide the exit code. |
+
+Prints the resolved configuration (hosts, table, index, CSV path and whether the
 CSV is readable) and then asks each engine whether it is up and how many documents it holds.
 Exits non-zero if either engine is unhealthy. The same information is available as JSON at
 `GET /api/health`.
@@ -228,7 +236,7 @@ Exits non-zero if either engine is unhealthy. The same information is available 
 | `make logs` | Follow all service logs. |
 | `make shell` | Bash in the php container (working dir `/app`). |
 | `make mysql-cli` | `mysql` client on the `autocomplete` database. |
-| `make reset` | `destroy` + `up` + `install` + `import`. The full from-scratch rebuild. |
+| `make reset` | `destroy` + `up` + `install` + `import`. The full from-scratch rebuild. Passes `CSV=` and `ARGS=` through to the import. |
 | `make destroy` | Stop the stack **and delete the volumes** — this wipes every imported document. |
 
 ## The comparison UI
@@ -324,7 +332,7 @@ than this paragraph.
 
 ```
 bin/console              CLI entrypoint (import, benchmark, health)
-src/Command/             the three commands
+src/Command/             the three commands + the shared --csv option
 src/Import/              CSV reading, aggregation, the two indexers
 src/Suggest/             the two suggesters behind one interface
 src/Model/               engine-agnostic query and result types
@@ -337,7 +345,11 @@ docker/                  php, nginx and mysql configuration
 ```
 
 Configuration is environment variables only, read in `src/Config.php`; `docker-compose.yml`
-injects them and `.env.example` documents them. The defaults are the compose values, so
+injects them and `.env.example` documents them. The CSV path is the exception: it is a CLI
+option (`--csv/-f`, defined once in `src/Command/CsvPathOption.php` and shared by `import`
+and `health`), because it is the one setting that changes per run rather than per environment.
+It has no default — `CSV_PATH` can pin one for an environment that always reads the same
+file, and otherwise the option is required. The other defaults are the compose values, so
 `bin/console` also runs from the host against the forwarded ports if you copy `.env.example`
 to `.env` and use the host values noted in it.
 
@@ -350,24 +362,27 @@ of the mapping in `docker-compose.yml` (`"8081:80"`, `"3308:3306"`, `"9201:9200"
 compose network on their internal ports, so nothing else needs changing.
 
 **`health` says `documents: 0`.** The engine is up but nothing has been imported into it —
-the volumes are fresh, or `make destroy` ran, or the import failed partway. Run `make import`.
+the volumes are fresh, or `make destroy` ran, or the import failed partway. Run
+`make import CSV=...`.
 If only one engine shows 0, that engine was down during the import; the importer continues
 with whatever is reachable and warns, so re-run for that engine alone
-(`make import-es` / `make import-mysql`).
+(`make import-es CSV=...` / `make import-mysql CSV=...`).
 
 **`health` says an engine is not ok.** `docker compose ps` — Elasticsearch in particular can
 be killed by the OOM killer if Docker Desktop has less memory than its 1 GB heap plus
 overhead. `make logs` shows why.
 
-**The import fails immediately with a CSV error.** The message names the path it tried. Either
-`openaddress-bevlg.csv` is not in the project root, or the export's header changed — the
+**The import fails immediately with a CSV error.** The message names the path it tried, or
+says none was given. Pass the file with `--csv/-f`, or `make import CSV=...`. If the path is
+right, the export's header changed — the
 importer refuses to guess at column positions, so a changed export fails loud instead of
 silently importing the wrong fields. Compare the printed header against
 `src/Import/CsvColumns.php`.
 
 **`make destroy` wipes the volumes.** Both the MySQL data directory and the Elasticsearch data
 directory are named volumes; `down -v` deletes them and the next import starts from nothing
-(another ~38 s). `make down` does not. `make reset` is destroy + rebuild + import in one go.
+(another ~38 s). `make down` does not. `make reset CSV=...` is destroy + rebuild + import in
+one go.
 
 **Dependencies are not installed.** `bin/console` says so and exits; `make install`.
 
@@ -403,10 +418,140 @@ disqualified — at street level it is fast and returns a sensible list for well
 and it needs no extra infrastructure. If the endpoint ever had to ship without a new service
 to operate, it would do. It just loses on the axis that matters most for this feature.
 
-Neither result speaks to the questions in `open-questions.txt` — how UDB3 places should rank
-against addresses, and whether house-number labels get indexed. Both are modelling decisions
-that land the same way on either engine, and both are worth settling before the real
-implementation starts.
+Neither result speaks to the two modelling questions still open — how UDB3 places should rank
+against addresses, and whether house-number labels get indexed. Both land the same way on
+either engine, so neither one changes the choice above, and both are worth settling before the
+real implementation starts.
+
+## Tuning headroom on Elasticsearch
+
+The conclusion picks Elasticsearch partly because it *leaves room to tune*. This is that room,
+audited against what the POC actually implements rather than against the manual. None of it is
+needed for the comparison above to hold — the two engines are already configured symmetrically
+and the numbers stand. It is the list to work through once the endpoint is real, ordered by
+what it costs to try.
+
+### Already mapped, never queried
+
+Three fields exist in the mapping and do nothing in the query. These are not tuning knobs so
+much as loose ends, and they are the cheapest wins in this section.
+
+- **`primary_name.keyword`** (`ElasticsearchMapping.php:189`) is never searched. An exact
+  full-name term boost, ranked above `BOOST_NAME_PHRASE_PREFIX`, would make a fully typed
+  `goorbaan` outrank every street that merely *starts* with it. One clause.
+- **`aliases`** (`ElasticsearchMapping.php:142`) is never searched either. The comment there
+  claims an alias hit is "scored like a name hit"; it is not — aliases only reach the query
+  through `search_text`, where they are unboosted and un-n-grammed. FR/DE names and
+  sub-localities are effectively second-class citizens in the ranking today.
+- **`location`** (`ElasticsearchMapping.php:164`) is a `geo_point` that contributes nothing to
+  the score. See [Geo](#geo-the-unused-signal) below — it is the largest single omission.
+
+`label`, `street_name`, `house_number` and `box_number` are also analysed and indexed but only
+ever read back out of `_source`. `index: false` on those four costs nothing and shrinks the
+index.
+
+### Precision, with the index as it stands
+
+No reindex required for any of these.
+
+**Completed tokens are matched as prefixes too.** The recall gate
+(`ElasticsearchSuggester.php:285`) runs *every* token against `search_text`, which is
+edge-n-grammed at index time. So in `gent kort` the finished token `gent` also matches
+`gentbrugge` and `gentse`, and recall is quietly wider than the docblock claims. Type-ahead
+semantics are that the last token is a prefix and every earlier one is a complete word —
+`SuggestQuery::completeTokens()` and `::lastToken()` already draw exactly that line, and
+nothing in the ES suggester uses either. Gating complete tokens against `primary_name.folded`
+and n-gramming only the last one is the single biggest precision change available here.
+
+**`minimum_should_match` on the gate** (`"2<-1"`, or a percentage) instead of the hard
+`operator: and`. Lowers the zero-result rate on three-token queries, and with it how often the
+fuzzy second pass has to fire at all.
+
+**`collapse` on `street_name`.** `kerkstraat` currently answers with ten Kerkstraats in ten
+different municipalities. Field collapsing — or a diversifying rescore — is what turns that
+top-10 back into something worth showing. Note this interacts with `track_total_hits`.
+
+**`rank_feature` with a `saturation` function** instead of `field_value_factor` + `log1p` for
+popularity. Cheaper to execute, and `pivot` is a far more legible knob than a factor whose
+damping runs backwards from the intuition (as the comment at `ElasticsearchSuggester.php:437`
+already has to apologise for).
+
+### Geo, the unused signal
+
+The briefing is *Zoek op route & locatie*, every street document carries the average
+coordinate of its addresses, the field is mapped as a `geo_point` — and ranking ignores it
+completely. A `distance_feature` query, or a `gauss` decay function with its origin set to the
+user's position or the map viewport's centre, is the highest-value thing missing from the
+Elasticsearch side.
+
+`kerkstraat` near Herselt and `kerkstraat` near Gent are different answers to the same string.
+Today they are identical, and no amount of boost tuning on the text clauses can separate them.
+
+### Analysis-level changes
+
+These need a reindex, with one exception.
+
+| Change | Why |
+|---|---|
+| **Search-time synonyms** (`synonym_graph`) | `st↔sint`, `str↔straat`, `dr↔dokter`, `stwg↔steenweg`, `o l v↔onze lieve vrouw`. Belgian address search lives on these abbreviations. As a search-only analyzer this is the one item here that needs **no reindex**. |
+| **Dutch decompounding** (`dictionary_decompounder`) | Edge n-grams are prefixes only, so `straat` never finds `Lindenstraat`. Dutch compounds make infix matching a real gap; a targeted street-suffix word list is much cheaper than a full n-gram field. |
+| **`index_prefixes`** instead of the edge-n-gram filter | Native, substantially smaller index, and it retires both the `MAX_GRAM = 20` cliff and the `preserve_original` workaround that exists to paper over it (`ElasticsearchMapping.php:28`, `:95`). |
+| **`similarity: boolean`** + `index_options: docs` on `search_text` | It is a pure recall gate, yet its BM25 term frequency still leaks into the final score as noise — and TF is close to meaningless on an n-grammed field anyway. |
+| **Phonetic matching** (`analysis-phonetic`) | Cologne phonetic or Double Metaphone is a recall tier that is *more precise* than edit distance for proper names: `sint niklaas` / `sint niclaas`. |
+
+Two that look tempting and are not. **Dutch stemming** has no business near proper names. And
+**ICU folding** is more correct than the hand-rolled `Normalizer::FOLD` map, but adopting it
+breaks the byte-for-byte folding parity with MySQL that this entire comparison rests on — if
+it ever goes in, it goes in on both sides or the benchmark stops meaning anything.
+
+### Alternative shapes worth a number
+
+Not improvements to the current query so much as baselines it should be measured against.
+
+- **`search_as_you_type` + `multi_match: bool_prefix`** replaces the whole hand-built n-gram
+  setup with one field type. This is an honest control: if it scores the same, the custom
+  analysis chain in `ElasticsearchMapping.php` is not earning its complexity.
+- **The completion suggester (FST), with contexts** on `doc_type` and geo, plus per-document
+  weights. Sub-millisecond — the latency floor. Not shippable on its own (no multi-token
+  reordering, no filtering beyond contexts), but it is the number that shows what the flexible
+  query actually costs.
+- **`rescore`** — cheap gate over the window, expensive phrase-prefix and geo clauses only
+  across the top N. This is the mechanism that keeps a `--level=address` index of 3.9M
+  documents viable rather than merely possible.
+
+### Latency and ops
+
+- **`track_total_hits: false`.** 1000 (`ElasticsearchSuggester.php:47`) still pays for
+  collection the UI never reads; it shows ten rows and a "more" indicator.
+- **`docvalue_fields`** instead of `_source` for the twelve flat fields in `SOURCE_FIELDS`,
+  skipping `_source` decompression per hit.
+- **`filter_path` on the response, plus HTTP keep-alive and compression.** The suggester
+  already measures `overhead_ms` exceeding `es_took_ms` on small result sets
+  (`ElasticsearchSuggester.php:171-176`) and says so in the debug payload. This is the lever
+  for the half of the latency that is not search.
+- **`refresh_interval: 30s`** in steady state instead of `1s`
+  (`ElasticsearchMapping.php:231`). The address register is read-mostly and refreshed weekly;
+  near-real-time visibility buys nothing and costs segments.
+- **Index sorting by popularity**, which is what makes `terminate_after` safe on the
+  one- and two-character prefixes that dominate the latency tail. Also `index.store.preload`.
+
+Force-merging to a single segment after import is already done (`ElasticsearchIndexer.php:159`)
+and is a large part of why the p95 above looks the way it does.
+
+### Measuring instead of guessing
+
+- **The `_rank_eval` API** computes precision@k, MRR and NDCG server-side.
+  `benchmark/golden.json` is already in very nearly the shape it expects, so this is mostly a
+  translation exercise — and it removes our own scoring code from the loop.
+- **`profile: true`** gives per-clause timings, which tells you which of the six `should`
+  clauses actually costs anything *before* you spend an afternoon tuning its boost.
+- **A boost sweep.** The seven `BOOST_*` constants and the popularity factor are a small
+  enough space to grid-search against MRR on the golden set. A `benchmark --sweep` mode would
+  replace hand-tuning with a number, which is the whole spirit of this repo.
+
+**If only three things get done:** the two loose ends above (`primary_name.keyword` and
+`aliases`), the completed-token prefix leak, and geo. The first three are defects wearing the
+costume of tuning knobs; the fourth is the feature the briefing is actually about.
 
 ## Caveats and known issues
 

@@ -32,15 +32,26 @@ final class HealthCommand extends Command
         parent::__construct();
     }
 
+    protected function configure(): void
+    {
+        CsvPathOption::configure($this);
+    }
+
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
         $io = new SymfonyStyle($input, $output);
         $config = $this->container->config;
 
+        // Resolved the same way import resolves it, so this report is about
+        // the file an import would actually read. Unset is not an error here:
+        // health is primarily about the engines, and the import commands say
+        // their own piece when they need a path and have none.
+        $csvPath = CsvPathOption::resolveOptional($input, $config);
+
         $io->title('Health');
 
-        $csvReadable = is_readable($config->csvPath);
-        $csvSize = $csvReadable ? filesize($config->csvPath) : false;
+        $csvReadable = $csvPath !== null && is_readable($csvPath);
+        $csvSize = $csvReadable ? filesize((string) $csvPath) : false;
 
         $io->section('Configuration');
         $io->definitionList(
@@ -50,10 +61,12 @@ final class HealthCommand extends Command
             ['mysql user' => $config->mysqlUser],
             ['elasticsearch host' => $config->elasticsearchHost],
             ['elasticsearch index' => $config->elasticsearchIndex],
-            ['csv path' => $config->csvPath],
-            ['csv' => $csvReadable
-                ? sprintf('readable, %.1f MiB', ($csvSize === false ? 0 : $csvSize) / 1048576)
-                : 'NOT READABLE'],
+            ['csv path' => $csvPath ?? 'not set (pass --csv/-f)'],
+            ['csv' => match (true) {
+                $csvReadable => sprintf('readable, %.1f MiB', ($csvSize === false ? 0 : $csvSize) / 1048576),
+                $csvPath === null => 'n/a',
+                default => 'NOT READABLE',
+            }],
         );
 
         $rows = [];
@@ -82,8 +95,13 @@ final class HealthCommand extends Command
         $io->section('Engines');
         $io->table(['engine', 'ok', 'documents', 'detail'], $rows);
 
-        if (!$csvReadable) {
-            $io->warning(sprintf('CSV not readable at %s; import will fail.', $config->csvPath));
+        // Only when a path was actually named: "you did not pass --csv" is not a
+        // health problem, it is just this command being run without one.
+        if ($csvPath !== null && !$csvReadable) {
+            $io->warning(sprintf(
+                'CSV not readable at %s; an import from it will fail.',
+                $csvPath,
+            ));
         }
 
         if (!$healthy) {

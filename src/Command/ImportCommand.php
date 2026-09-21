@@ -62,13 +62,9 @@ final class ImportCommand extends Command
                 InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY,
                 'Restrict the import to these postcodes (repeatable)',
             )
-            ->addOption('recreate', null, InputOption::VALUE_NONE, 'Drop and rebuild the table/index first')
-            ->addOption(
-                'csv',
-                'f',
-                InputOption::VALUE_REQUIRED,
-                'Import from this CSV instead of the configured one; relative paths resolve against the working directory (/app in the container)',
-            );
+            ->addOption('recreate', null, InputOption::VALUE_NONE, 'Drop and rebuild the table/index first');
+
+        CsvPathOption::configure($this);
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -84,14 +80,13 @@ final class ImportCommand extends Command
             return Command::INVALID;
         }
 
-        $csvPath = $this->resolveCsvPath($input);
-
         // Validate before anything destructive runs. DocumentSource only reads
         // the header when the generator is first pulled, which is after
         // --recreate has already dropped the table and after the progress bar
         // has started drawing, so a wrong file used to surface as an uncaught
         // exception over a half-wiped index.
         try {
+            $csvPath = CsvPathOption::resolve($input, $this->container->config);
             $this->assertUsableCsv($csvPath);
             $source = new DocumentSource($csvPath);
         } catch (Throwable $e) {
@@ -384,25 +379,6 @@ final class ImportCommand extends Command
     }
 
     /**
-     * --csv/-f wins over CSV_PATH; relative paths are taken from the working
-     * directory, which is /app in the container, so `-f data/addresses.csv` works.
-     * The absolute form is what gets printed and put into every error message,
-     * because "not found: data/addresses.csv" is not enough to debug a path.
-     */
-    private function resolveCsvPath(InputInterface $input): string
-    {
-        $csv = $input->getOption('csv');
-
-        if (!is_string($csv) || $csv === '') {
-            return $this->container->config->csvPath;
-        }
-
-        $resolved = realpath($csv);
-
-        return $resolved === false ? $csv : $resolved;
-    }
-
-    /**
      * Cheap up-front check: one stat plus one line of I/O.
      *
      * Everything it rejects would otherwise fail later and worse — either deep
@@ -413,8 +389,7 @@ final class ImportCommand extends Command
         if (!file_exists($path)) {
             throw new RuntimeException(sprintf(
                 "CSV file not found: %s\n"
-                . "Relative paths resolve against %s (the project root inside the container).\n"
-                . 'Either pass an existing file with --csv/-f, or put openaddress-bevlg.csv in the project root.',
+                . 'Relative paths resolve against %s (the project root inside the container).',
                 $path,
                 (string) getcwd(),
             ));

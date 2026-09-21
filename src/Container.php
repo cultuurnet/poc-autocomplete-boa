@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace App;
 
-use App\Import\DocumentSource;
 use App\Import\ElasticsearchIndexer;
 use App\Import\IndexerInterface;
 use App\Import\MysqlIndexer;
@@ -50,11 +49,6 @@ final class Container
             ->setHosts([$this->config->elasticsearchHost])
             ->setRetries(1)
             ->build();
-    }
-
-    public function documentSource(): DocumentSource
-    {
-        return new DocumentSource($this->config->csvPath);
     }
 
     public function mysqlSuggester(): MysqlSuggester
