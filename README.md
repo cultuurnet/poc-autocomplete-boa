@@ -335,8 +335,9 @@ best-effort second pass.
 
 **Elasticsearch** — edge-ngram analysis at index time with a plain folding analyzer at search
 time, `must` clauses that gate recall (finished words against whole-word terms, the token
-still being typed against the n-grams), boosted `should` clauses for precision, and a
-`function_score` applying the same log-damped popularity. Fuzziness is native.
+still being typed against the n-grams, and only the tokens that name a place at all), boosted
+`should` clauses for precision, and a `function_score` applying the same log-damped
+popularity. Fuzziness is native.
 
 The asymmetry in that last sentence is the point of the POC. Read the benchmark output rather
 than this paragraph.
@@ -493,6 +494,46 @@ Measured over the 106-query benchmark set, the narrower gate changes the candida
 queries, by one or two documents each, and takes no query to zero results. Golden-set MRR
 went from 0.895 to 0.929 and hit@1 from 24 to 27 of 30.
 
+One query in the set still comes back empty from Elasticsearch: `straat lange gent`, where
+`straat` is a finished token and no document holds it as a whole word — *Straatje* does. That
+is the honest cost of whole-word gating, and the fix for it is
+[decompounding](#analysis-level-changes), not a looser gate.
+
+**House numbers and box references were gating the search** — *done, and this one was a
+plain defect rather than a tuning knob.* Every token had to appear in the document, so the
+most ordinary way a Belgian writes an address returned **nothing at all** from
+Elasticsearch:
+
+| query | mysql | es before | es after |
+|---|---|---|---|
+| `kerkstraat 2 gent` | 3 | **0** | 3 — *Kerkstraat, 9050 Gent* |
+| `goorbaan 59 herselt` | 1 | **0** | 1 — *Goorbaan, 2230 Herselt* |
+| `kerkstraat 12 bus 5` | 3 | **0** | 3 |
+| `meir 1 antwerpen` | 3 | **0** | 1 — *Meir, 2000 Antwerpen* |
+| `veldstraat 10 9000` | 3 | **0** | 1 — *Veldstraat, 9000 Gent* |
+
+A street document carries no house number, so demanding one finds nothing; `bus` is worse
+still, because `SuggestionDocument::searchText()` never puts `box_number` into the haystack at
+any level, so the word can never match in either engine.
+
+`SuggestQuery` now splits the tokens into **locative** ones (the street, the postcode, the
+municipality — what can narrow a search) and **address detail** (house number, box marker, box
+number). Only the locative half reaches the gate; the detail half moves to a `should` at
+`BOOST_ADDRESS_DETAIL`, which is what puts number 59 first on an address-level index and
+harmlessly scores zero on a street-level one. Query-side only — **no reindex**.
+
+Two details worth knowing. The token still being typed is only treated as a prefix while it is
+still part of the place name: in `goorbaan 5` the street is finished, so it is gated as a whole
+word. And a query made of *nothing but* detail does not split — on a bare `22` the number is
+all the user has given us, so it has to keep narrowing. (That guard earns its keep: `bus` on
+its own is a street in Eeklo.)
+
+MySQL was never doing this properly either. Its boolean query for `kerkstraat 12 bus 5` is
+`+kerkstraat* +bus*` — it drops `12` and `5` only because they are shorter than
+`FULLTEXT_MIN_PREFIX`, keeps `bus`, fails its own fulltext pass, and is rescued by the
+`fuzzy_prefix` fallback. It gets the right answer by luck, not by design, which is why the
+Elasticsearch fix does not mirror it.
+
 **`minimum_should_match` on the gate** (`"2<-1"`, or a percentage) instead of the hard
 `operator: and`. Lowers the zero-result rate on three-token queries, and with it how often the
 fuzzy second pass has to fire at all.
@@ -583,7 +624,10 @@ and is a large part of why the p95 above looks the way it does.
 `aliases`), the completed-token prefix leak, and geo. The first three are defects wearing the
 costume of tuning knobs; the fourth is the feature the briefing is actually about.
 
-**Status:** the first three are done. Geo is not.
+**Status:** the first three are done. Geo is not. A fourth item that was not on this list at
+all turned out to matter more than any of them — house numbers and box references were gating
+the search, so `kerkstraat 2 gent` returned nothing; that is fixed too, and written up
+[above](#precision-with-the-index-as-it-stands).
 
 They were applied to **Elasticsearch only**, on purpose — the point was to fix the engine the
 POC recommends, not to re-run the comparison. That makes the two engines asymmetric from here

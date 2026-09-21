@@ -93,6 +93,13 @@ final class ElasticsearchSuggester implements SuggesterInterface
     /** A 1-3 digit last token that is plausibly a postcode being typed. */
     private const BOOST_POSTCODE_PARTIAL = 3.0;
 
+    /**
+     * A house number or box number the document actually carries. Only ever
+     * earned at address level; below the postcode and name boosts because
+     * getting the street right matters more than getting the number right.
+     */
+    private const BOOST_ADDRESS_DETAIL = 4.0;
+
     private const BOOST_MUNICIPALITY = 1.5;
 
     /**
@@ -294,6 +301,13 @@ final class ElasticsearchSuggester implements SuggesterInterface
      * search_text. Every token before it is a word they finished, so it has to
      * match a whole word, against search_text.folded.
      *
+     * Only the *locative* tokens reach the gate at all. A house number or a box
+     * reference ("kerkstraat 12 bus 5") describes a level of detail no street
+     * document carries, so requiring it returned nothing for a completely
+     * ordinary way of writing an address - see SuggestQuery::locativeTokens().
+     * Those tokens are not thrown away; precisionClauses() still ranks on them,
+     * which is what puts number 59 at the top of an address-level index.
+     *
      * Running the finished tokens against the n-grammed field too - which is
      * what this used to do - quietly widened recall: in "gent kort" the complete
      * word "gent" also matched Gentbrugge and Gentse, because both contain an
@@ -317,27 +331,37 @@ final class ElasticsearchSuggester implements SuggesterInterface
         }
 
         $clauses = [];
-        $completeTokens = $query->completeTokens();
+        $wholeWords = $query->locativeTokens();
+        $prefix = null;
 
-        if ($completeTokens !== []) {
+        // The token still being typed is only a prefix while it is still part of
+        // the place name. In "goorbaan 5" the user has finished with the street
+        // and moved on to the number, so "goorbaan" is gated as a whole word.
+        if ($query->isTypingLocative()) {
+            $prefix = array_pop($wholeWords);
+        }
+
+        if ($wholeWords !== []) {
             $clauses[] = [
                 'match' => [
                     'search_text.folded' => [
-                        'query' => implode(' ', $completeTokens),
+                        'query' => implode(' ', $wholeWords),
                         'operator' => 'and',
                     ],
                 ],
             ];
         }
 
-        $clauses[] = [
-            'match' => [
-                'search_text' => [
-                    'query' => $query->lastToken(),
-                    'operator' => 'and',
+        if ($prefix !== null) {
+            $clauses[] = [
+                'match' => [
+                    'search_text' => [
+                        'query' => $prefix,
+                        'operator' => 'and',
+                    ],
                 ],
-            ],
-        ];
+            ];
+        }
 
         return $clauses;
     }
@@ -419,6 +443,10 @@ final class ElasticsearchSuggester implements SuggesterInterface
             ],
         ];
 
+        foreach ($this->addressDetailClauses($query) as $clause) {
+            $clauses[] = $clause;
+        }
+
         // Alternative names. Without this the field is indexed and never read:
         // "Gand" or "Anvers" would pass the gate through search_text and then be
         // ranked on popularity alone, because no precision clause could see why
@@ -448,6 +476,47 @@ final class ElasticsearchSuggester implements SuggesterInterface
             // expansion cheap and reflects that people rarely mistype the letter
             // they just started a word with.
             $clauses[] = ['match' => ['search_text' => $this->fuzzyOptions($text, 'or', self::BOOST_FUZZY)]];
+        }
+
+        return $clauses;
+    }
+
+    /**
+     * House numbers and box references: ranking only, never recall.
+     *
+     * At street level these never match - a street document holds no house
+     * number - and that is fine, because at street level they are not what
+     * distinguishes one answer from another. At `--level=address` they are: the
+     * whole point of typing "goorbaan 59" is that 59 comes first out of the two
+     * hundred addresses on the street.
+     *
+     * Matched against search_text.folded rather than the n-grammed parent so
+     * that "59" means 59 and not also 590 and 591, and rather than against the
+     * house_number field, which is `index: false` and holds the raw register
+     * value ("12A") against folded query tokens.
+     *
+     * @return list<array<string, mixed>>
+     */
+    private function addressDetailClauses(SuggestQuery $query): array
+    {
+        $clauses = [];
+
+        foreach ($query->detailTokens() as $token) {
+            // The marker word itself is not in any haystack - SuggestionDocument
+            // never puts box_number into search_text - so a clause on it could
+            // only ever score zero.
+            if (Normalizer::isBoxMarkerToken($token) || $token === 'b') {
+                continue;
+            }
+
+            $clauses[] = [
+                'match' => [
+                    'search_text.folded' => [
+                        'query' => $token,
+                        'boost' => self::BOOST_ADDRESS_DETAIL,
+                    ],
+                ],
+            ];
         }
 
         return $clauses;

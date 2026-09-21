@@ -116,4 +116,18 @@ final class Normalizer
     {
         return preg_match('/^[0-9]{1,4}[a-z]{0,3}$/', $token) === 1 && !self::isPostcodeToken($token);
     }
+
+    /**
+     * True for the word that introduces a box number in a Belgian address:
+     * "Kerkstraat 12 bus 5". NL "bus", FR "bte"/"boite".
+     *
+     * The bare "b" of "12 b 5" is deliberately absent: on its own it is the
+     * first keystroke of far too many street and municipality names to spend on
+     * a box marker. SuggestQuery reads it as one only directly after a house
+     * number, where that ambiguity does not exist.
+     */
+    public static function isBoxMarkerToken(string $token): bool
+    {
+        return in_array($token, ['bus', 'bte', 'boite'], true);
+    }
 }
