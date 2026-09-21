@@ -18,6 +18,13 @@ const SHORT_NAME = { mysql: 'MySQL', elasticsearch: 'ES' };
 const DEBOUNCE_MS = 120;
 const HISTORY_SIZE = 20;
 
+// ngrok serves an interstitial warning page instead of the API response unless
+// the request carries this header; the value is irrelevant, only its presence.
+const API_HEADERS = {
+  Accept: 'application/json',
+  'ngrok-skip-browser-warning': '1',
+};
+
 const dom = {
   q: document.getElementById('q'),
   limit: document.getElementById('limit'),
@@ -180,7 +187,7 @@ async function fetchEngine(engine, query, types, seq) {
   try {
     const response = await fetch(buildUrl(engine, query, types), {
       signal: state.abort.signal,
-      headers: { Accept: 'application/json' },
+      headers: API_HEADERS,
     });
 
     const body = await response.json();
@@ -485,7 +492,7 @@ async function loadHealth() {
   dom.health.replaceChildren(el('span', 'health-item is-unknown', 'checking engines…'));
 
   try {
-    const response = await fetch('api/health', { headers: { Accept: 'application/json' } });
+    const response = await fetch('api/health', { headers: API_HEADERS });
     const body = await response.json();
     const items = ENGINES.map((engine) => {
       const info = body?.engines?.[engine];
