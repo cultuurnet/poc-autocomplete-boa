@@ -252,8 +252,11 @@ for each engine:
   the rank they hold in the other column (`es #4 ↑`) — disagreement is where the interesting
   differences are
 - the per-result score and, behind the *why this rank* toggle, the scoring detail that engine
-  reported: for MySQL the individual ranking components, for Elasticsearch its explain-style
-  breakdown
+  reported: for MySQL the individual ranking components, which it computes anyway, and for
+  Elasticsearch its `_explanation` tree — but only when the **Explain** checkbox in the header
+  is ticked. It is off by default because the explanation is several times the size of the hit
+  and Elasticsearch has to do extra work to produce it, so the latency numbers shown with it on
+  are not comparable to the ones shown with it off
 
 Limit, fuzzy matching and document types are switchable in the header, because the engines
 diverge most sharply on typo tolerance. Arrow keys move between columns and rows, Enter pins
@@ -268,8 +271,17 @@ curl "http://localhost:8080/api/health"
 ```
 
 `q` is capped at 120 characters, `limit` at 50, `types` is a comma-separated subset of
-`address,street,municipality,postcode`, `fuzzy` defaults to on. One failing engine degrades
-to an empty column carrying an `error` string rather than taking the request down.
+`address,street,municipality,postcode`, `fuzzy` defaults to on and `explain` to off. One
+failing engine degrades to an empty column carrying an `error` string rather than taking the
+request down.
+
+`explain=1` asks Elasticsearch for its `_explanation` tree and returns it under each
+suggestion's `debug`. It makes the request measurably more expensive to serve, so it is off
+unless asked for and should never be on while benchmarking:
+
+```bash
+curl "http://localhost:8080/api/suggest?q=goorbaan&limit=1&explain=1&engine=elasticsearch"
+```
 
 ## The benchmark
 
@@ -322,7 +334,8 @@ popularity boost. MySQL has no native fuzzy matching, so typo tolerance is a del
 best-effort second pass.
 
 **Elasticsearch** — edge-ngram analysis at index time with a plain folding analyzer at search
-time, a `must` clause that gates recall, boosted `should` clauses for precision, and a
+time, `must` clauses that gate recall (finished words against whole-word terms, the token
+still being typed against the n-grams), boosted `should` clauses for precision, and a
 `function_score` applying the same log-damped popularity. Fuzziness is native.
 
 The asymmetry in that last sentence is the point of the POC. Read the benchmark output rather
@@ -394,7 +407,7 @@ iterations after 3 warm-ups, against the same 82,643 documents in both engines:
 | | p50 | p95 | max | stddev | hit@10 | MRR |
 |---|---|---|---|---|---|---|
 | MySQL | 2.50 ms | 8.62 ms | 34.6 ms | 3.74 | 28/30 (93%) | 0.823 |
-| Elasticsearch | 2.01 ms | 3.59 ms | 7.25 ms | 0.88 | 30/30 (100%) | 0.895 |
+| Elasticsearch | 2.01 ms | 3.59 ms | 7.25 ms | 0.88 | 30/30 (100%) | 0.929 |
 
 Three things decided it:
 
@@ -433,35 +446,52 @@ what it costs to try.
 
 ### Already mapped, never queried
 
-Three fields exist in the mapping and do nothing in the query. These are not tuning knobs so
-much as loose ends, and they are the cheapest wins in this section.
+Three fields existed in the mapping and did nothing in the query. Two of them are now wired
+up; the third is the geo signal, which is a feature rather than a loose end.
 
-- **`primary_name.keyword`** (`ElasticsearchMapping.php:189`) is never searched. An exact
-  full-name term boost, ranked above `BOOST_NAME_PHRASE_PREFIX`, would make a fully typed
-  `goorbaan` outrank every street that merely *starts* with it. One clause.
-- **`aliases`** (`ElasticsearchMapping.php:142`) is never searched either. The comment there
-  claims an alias hit is "scored like a name hit"; it is not — aliases only reach the query
-  through `search_text`, where they are unboosted and un-n-grammed. FR/DE names and
-  sub-localities are effectively second-class citizens in the ranking today.
-- **`location`** (`ElasticsearchMapping.php:164`) is a `geo_point` that contributes nothing to
-  the score. See [Geo](#geo-the-unused-signal) below — it is the largest single omission.
+- **`primary_name.keyword`** — *done.* It now carries the `folding_keyword` normaliser, so the
+  single term it stores is byte-for-byte what `SuggestQuery::normalized()` sends, and
+  `BOOST_NAME_EXACT` (12.0, above `BOOST_NAME_PHRASE_PREFIX`) fires on it. Without the
+  normaliser the subfield holds `Goorbaan` while the query side sends `goorbaan`, so the
+  "one clause" this used to describe would have matched nothing — the folding is the fix, the
+  clause is the easy half.
+- **`aliases`** — *done.* Now n-grammed like `primary_name` and carried by its own clause at
+  `BOOST_ALIAS` (1.8). Deliberately *not* "scored like a name hit", as the old comment
+  claimed: `DocumentSource::aliases()` also files the municipality name under aliases, so a
+  name-weighted clause would count the city twice for every document in the index.
+- **`location`** (`ElasticsearchMapping.php`) is a `geo_point` that contributes nothing to the
+  score. See [Geo](#geo-the-unused-signal) below — it remains the largest single omission, and
+  unlike the two above it needs an origin the API does not currently accept.
 
-`label`, `street_name`, `house_number` and `box_number` are also analysed and indexed but only
-ever read back out of `_source`. `index: false` on those four costs nothing and shrinks the
-index.
+`label` and `street_name` are now `index: false`, and `house_number` and `box_number` are
+`index: false` keywords; all four are read only out of `_source`. `street_name` keeps its
+`.keyword` subfield, which is doc_values rather than an inverted index and is what a
+`collapse` on the street would read. `label` lost its own — grouping or sorting on a rendered
+display string means nothing that grouping on `street_name` does not mean better, and the
+subfield was 3.8 MB of the index.
+
+With all of the above applied the index is 40.8 MB, slightly *under* the 41.2 MB it took
+before, despite gaining `search_text.folded`, n-grammed `aliases` and a normalised
+`primary_name.keyword`.
 
 ### Precision, with the index as it stands
 
 No reindex required for any of these.
 
-**Completed tokens are matched as prefixes too.** The recall gate
-(`ElasticsearchSuggester.php:285`) runs *every* token against `search_text`, which is
-edge-n-grammed at index time. So in `gent kort` the finished token `gent` also matches
-`gentbrugge` and `gentse`, and recall is quietly wider than the docblock claims. Type-ahead
-semantics are that the last token is a prefix and every earlier one is a complete word —
-`SuggestQuery::completeTokens()` and `::lastToken()` already draw exactly that line, and
-nothing in the ES suggester uses either. Gating complete tokens against `primary_name.folded`
-and n-gramming only the last one is the single biggest precision change available here.
+**Completed tokens are matched as prefixes too** — *done.* The recall gate used to run
+*every* token against the edge-n-grammed `search_text`, so in `meir antwerpen` the finished
+token `meir` also admitted *Meirbrug*. `ElasticsearchSuggester::gateClauses()` now splits the
+query the way `SuggestQuery::completeTokens()` and `::lastToken()` always described it: every
+finished token has to match a whole word, against a new non-n-grammed `search_text.folded`
+subfield, and only the token still being typed matches a prefix.
+
+Note this needs the `.folded` subfield rather than `primary_name.folded` as first sketched
+here — a completed token is very often the municipality or the postcode, which never appear
+in the primary name, so gating on the name would have thrown away most multi-token queries.
+
+Measured over the 106-query benchmark set, the narrower gate changes the candidate set for 5
+queries, by one or two documents each, and takes no query to zero results. Golden-set MRR
+went from 0.895 to 0.929 and hit@1 from 24 to 27 of 30.
 
 **`minimum_should_match` on the gate** (`"2<-1"`, or a percentage) instead of the hard
 `operator: and`. Lowers the zero-result rate on three-token queries, and with it how often the
@@ -552,6 +582,16 @@ and is a large part of why the p95 above looks the way it does.
 **If only three things get done:** the two loose ends above (`primary_name.keyword` and
 `aliases`), the completed-token prefix leak, and geo. The first three are defects wearing the
 costume of tuning knobs; the fourth is the feature the briefing is actually about.
+
+**Status:** the first three are done. Geo is not.
+
+They were applied to **Elasticsearch only**, on purpose — the point was to fix the engine the
+POC recommends, not to re-run the comparison. That makes the two engines asymmetric from here
+on: the ES numbers in the Conclusion above are the post-fix ones, and the MySQL side still has
+the wider `+meir* +antwerpen*` gate and no exact-name or alias boost. Read the agreement
+figures accordingly — some of the remaining disagreement is now ours rather than the engines'.
+If the comparison ever has to be defended again as a like-for-like measurement, either mirror
+the three changes in `MysqlSuggester` or re-run it against the previous commit.
 
 ## Caveats and known issues
 

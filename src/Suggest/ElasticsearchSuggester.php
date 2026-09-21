@@ -72,6 +72,15 @@ final class ElasticsearchSuggester implements SuggesterInterface
     // numbers inline: the whole point of the POC is being able to explain why a
     // result is where it is, and to move one number at a time.
 
+    /**
+     * The name is *exactly* what has been typed, not merely started by it.
+     * Above BOOST_NAME_PHRASE_PREFIX because a finished word is a much stronger
+     * statement of intent than a prefix: once "goorbaan" is fully typed, the
+     * street called Goorbaan should outrank every Goorbaanstraat. The two
+     * clauses stack - an exact hit is also a prefix hit.
+     */
+    private const BOOST_NAME_EXACT = 12.0;
+
     /** The name literally starts with what has been typed. Nothing beats this. */
     private const BOOST_NAME_PHRASE_PREFIX = 8.0;
 
@@ -85,6 +94,15 @@ final class ElasticsearchSuggester implements SuggesterInterface
     private const BOOST_POSTCODE_PARTIAL = 3.0;
 
     private const BOOST_MUNICIPALITY = 1.5;
+
+    /**
+     * An alternative name for this document: the FR/DE translation, or the
+     * sub-locality a postcode covers. Deliberately below BOOST_NAME_MATCH and
+     * not "scored like a name hit": DocumentSource also files the municipality
+     * name under aliases, so a clause weighted like the real name would count
+     * the city twice for every document in the index.
+     */
+    private const BOOST_ALIAS = 1.8;
 
     private const BOOST_POST_NAME = 1.2;
 
@@ -248,7 +266,7 @@ final class ElasticsearchSuggester implements SuggesterInterface
                             'filter' => [
                                 ['terms' => ['doc_type' => $query->typeValues()]],
                             ],
-                            'must' => [$this->gateClause($text, $fuzzyFallback)],
+                            'must' => $this->gateClauses($query, $text, $fuzzyFallback),
                             'should' => $this->precisionClauses($query, $text, $fuzzyFallback),
                             // Explicit: `should` is pure ranking here. With a `must`
                             // present ES defaults to this anyway, but leaving it
@@ -271,21 +289,57 @@ final class ElasticsearchSuggester implements SuggesterInterface
     /**
      * The recall gate: every token must be present somewhere in the document.
      *
-     * search_text is n-grammed at index time and searched with whole words, so
-     * "2230 goorb" becomes the two terms "2230" and "goorb", both of which have
-     * to be found - "goorb" against the indexed prefix of "goorbaan". This is the
-     * direct equivalent of the MySQL side's `+2230* +goorb*` boolean query, which
-     * is what makes the two result sets comparable at all.
+     * Type-ahead splits the query in two. The last token is whatever the user is
+     * halfway through typing, so it matches as a prefix, against the n-grammed
+     * search_text. Every token before it is a word they finished, so it has to
+     * match a whole word, against search_text.folded.
      *
-     * @return array<string, mixed>
+     * Running the finished tokens against the n-grammed field too - which is
+     * what this used to do - quietly widened recall: in "gent kort" the complete
+     * word "gent" also matched Gentbrugge and Gentse, because both contain an
+     * indexed n-gram "gent". The gate is the one place in this query where
+     * nothing downstream can undo a mistake, so it is worth being exact about.
+     *
+     * The MySQL side issues `+gent* +kort*` and therefore keeps the older, wider
+     * semantics. That asymmetry is deliberate and is noted in the README: this
+     * is a precision fix on the engine the POC recommends, not a change to the
+     * measurement.
+     *
+     * @return list<array<string, mixed>>
      */
-    private function gateClause(string $text, bool $fuzzyFallback): array
+    private function gateClauses(SuggestQuery $query, string $text, bool $fuzzyFallback): array
     {
-        if (!$fuzzyFallback) {
-            return ['match' => ['search_text' => ['query' => $text, 'operator' => 'and']]];
+        // The fallback pass makes fuzziness itself the gate, and edit distance
+        // over whole words is the whole point of it, so the split does not apply:
+        // it runs the complete text through one fuzzy clause as before.
+        if ($fuzzyFallback) {
+            return [['match' => ['search_text' => $this->fuzzyOptions($text, 'and', 1.0)]]];
         }
 
-        return ['match' => ['search_text' => $this->fuzzyOptions($text, 'and', 1.0)]];
+        $clauses = [];
+        $completeTokens = $query->completeTokens();
+
+        if ($completeTokens !== []) {
+            $clauses[] = [
+                'match' => [
+                    'search_text.folded' => [
+                        'query' => implode(' ', $completeTokens),
+                        'operator' => 'and',
+                    ],
+                ],
+            ];
+        }
+
+        $clauses[] = [
+            'match' => [
+                'search_text' => [
+                    'query' => $query->lastToken(),
+                    'operator' => 'and',
+                ],
+            ],
+        ];
+
+        return $clauses;
     }
 
     /**
@@ -296,6 +350,18 @@ final class ElasticsearchSuggester implements SuggesterInterface
     private function precisionClauses(SuggestQuery $query, string $text, bool $fuzzyFallback): array
     {
         $clauses = [];
+
+        // The whole name, typed out. A term lookup, so it only fires on an exact
+        // match of the complete folded value - primary_name.keyword carries the
+        // folding normaliser precisely so that this comparison can succeed.
+        $clauses[] = [
+            'term' => [
+                'primary_name.keyword' => [
+                    'value' => $text,
+                    'boost' => self::BOOST_NAME_EXACT,
+                ],
+            ],
+        ];
 
         // Strongest signal by a wide margin: the name reads as a continuation of
         // what was typed ("korte linden" -> "Korte Lindenstraat"). Run against
@@ -349,6 +415,20 @@ final class ElasticsearchSuggester implements SuggesterInterface
                     'query' => $text,
                     'operator' => 'or',
                     'boost' => self::BOOST_POST_NAME,
+                ],
+            ],
+        ];
+
+        // Alternative names. Without this the field is indexed and never read:
+        // "Gand" or "Anvers" would pass the gate through search_text and then be
+        // ranked on popularity alone, because no precision clause could see why
+        // the document matched.
+        $clauses[] = [
+            'match' => [
+                'aliases' => [
+                    'query' => $text,
+                    'operator' => 'or',
+                    'boost' => self::BOOST_ALIAS,
                 ],
             ],
         ];

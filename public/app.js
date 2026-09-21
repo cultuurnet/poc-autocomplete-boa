@@ -29,6 +29,7 @@ const dom = {
   q: document.getElementById('q'),
   limit: document.getElementById('limit'),
   fuzzy: document.getElementById('fuzzy'),
+  explain: document.getElementById('explain'),
   types: Array.from(document.querySelectorAll('input.type')),
   status: document.getElementById('status'),
   health: document.getElementById('health'),
@@ -119,6 +120,10 @@ function buildUrl(engine, query, types) {
     limit: dom.limit.value,
     engine,
     fuzzy: dom.fuzzy.checked ? '1' : '0',
+    // Costs the engine real time, so it is only asked for when the panel it
+    // feeds is actually wanted; the timings shown while it is on are not
+    // comparable to the ones shown while it is off.
+    explain: dom.explain.checked ? '1' : '0',
   });
 
   // An empty selection would mean "search nothing", which the API reads as
@@ -647,6 +652,7 @@ function onKeydown(event) {
 dom.q.addEventListener('input', scheduleQuery);
 dom.limit.addEventListener('change', runQuery);
 dom.fuzzy.addEventListener('change', runQuery);
+dom.explain.addEventListener('change', runQuery);
 
 for (const box of dom.types) {
   box.addEventListener('change', () => {

@@ -36,6 +36,13 @@ final class ElasticsearchMapping
     public const INDEX_ANALYZER = 'autocomplete_index';
 
     /**
+     * Folding for keyword fields. A normaliser, not an analyser: it folds the
+     * whole value into one term rather than tokenising it, which is what an
+     * exact "the user typed the complete name" lookup needs.
+     */
+    public const KEYWORD_NORMALIZER = 'folding_keyword';
+
+    /**
      * Full create-index body.
      *
      * @return array{settings: array<string, mixed>, mappings: array<string, mixed>}
@@ -113,6 +120,21 @@ final class ElasticsearchMapping
                         'filter' => ['lowercase', 'asciifolding', 'autocomplete_edge_ngram'],
                     ],
                 ],
+                'normalizer' => [
+                    // The same folding, applied to a keyword field as a whole
+                    // instead of per token: "Sint-Genesius-Rode" is stored as the
+                    // single term "sint genesius rode", which is byte-for-byte
+                    // what Normalizer::normalize() produces for the query side.
+                    // That equality is the entire point - it is what lets the
+                    // exact-name term lookup in the suggester ever hit.
+                    // trim is needed because the char filter leaves a space
+                    // behind for a leading or trailing punctuation character.
+                    self::KEYWORD_NORMALIZER => [
+                        'type' => 'custom',
+                        'char_filter' => ['strip_punctuation'],
+                        'filter' => ['lowercase', 'asciifolding', 'trim'],
+                    ],
+                ],
             ],
         ];
     }
@@ -132,17 +154,27 @@ final class ElasticsearchMapping
                 'id' => ['type' => 'keyword'],
                 'doc_type' => ['type' => 'keyword'],
 
-                'label' => self::foldedText(),
-                'street_name' => self::foldedText(),
+                // Display values. No query touches them - the searchable copy of
+                // both lives in search_text and primary_name - so the analysed
+                // index is pure cost.
+                //
+                // street_name keeps a keyword subfield: it is doc_values rather
+                // than an inverted index, and it is what a collapse or a terms
+                // aggregation on the street would read. label gets none - it is a
+                // rendered string, so grouping or sorting on it means nothing that
+                // grouping on street_name does not mean better, and at 82k
+                // documents the subfield cost 3.8 MB of the index.
+                'label' => self::storedText(),
+                'street_name' => self::storedText(keyword: true),
+
                 'municipality_name' => self::foldedText(),
                 'post_name' => self::foldedText(),
 
-                // Multi-valued: FR/DE translations and sub-localities. Analysed the
-                // same way as the names so an alias hit is scored like a name hit.
-                'aliases' => [
-                    'type' => 'text',
-                    'analyzer' => self::SEARCH_ANALYZER,
-                ],
+                // Multi-valued: FR/DE translations and sub-localities. N-grammed
+                // exactly like primary_name, and boosted by its own clause in the
+                // suggester, so "Gand" ranks the document the way "Gent" does
+                // instead of only scraping through the recall gate.
+                'aliases' => self::autocompleteText(),
 
                 // Keyword for the exact "2230" term lookup, plus an n-grammed text
                 // subfield so a half-typed "22" is a cheap term match on an indexed
@@ -156,9 +188,10 @@ final class ElasticsearchMapping
 
                 // Kept verbatim (no normaliser) because they are display/identity
                 // values, not search targets: house numbers reach the query through
-                // search_text, which is already folded by SuggestionDocument.
-                'house_number' => ['type' => 'keyword'],
-                'box_number' => ['type' => 'keyword'],
+                // search_text, which is already folded by SuggestionDocument. Not
+                // indexed for the same reason - see the note on label above.
+                'house_number' => ['type' => 'keyword', 'index' => false],
+                'box_number' => ['type' => 'keyword', 'index' => false],
                 'nis_code' => ['type' => 'keyword'],
 
                 'location' => ['type' => 'geo_point'],
@@ -167,7 +200,20 @@ final class ElasticsearchMapping
                 // The catch-all recall gate, mirroring the MySQL FULLTEXT column.
                 // It is fed the already-deduplicated haystack from
                 // SuggestionDocument::searchText(), so both engines see one string.
-                'search_text' => self::autocompleteText(),
+                //
+                // The .folded subfield holds the same haystack tokenised into whole
+                // words instead of edge n-grams. Type-ahead needs both: the token
+                // the user is still typing is a prefix (parent field), every token
+                // before it is a finished word (.folded). Gating a finished word
+                // against the n-grammed parent is what made "gent kort" also match
+                // Gentbrugge and Gentse.
+                'search_text' => self::autocompleteText([
+                    'folded' => [
+                        'type' => 'text',
+                        'analyzer' => self::SEARCH_ANALYZER,
+                        'norms' => false,
+                    ],
+                ]),
 
                 'primary_name' => [
                     'type' => 'text',
@@ -186,7 +232,16 @@ final class ElasticsearchMapping
                     // which is tokenised normally.
                     'norms' => false,
                     'fields' => [
-                        'keyword' => ['type' => 'keyword', 'ignore_above' => 256],
+                        // Folded, so the single term stored here is exactly what
+                        // SuggestQuery::normalized() produces. Without the
+                        // normaliser this subfield holds "Goorbaan" while the query
+                        // side sends "goorbaan", and the exact-name term clause
+                        // would silently never match anything.
+                        'keyword' => [
+                            'type' => 'keyword',
+                            'normalizer' => self::KEYWORD_NORMALIZER,
+                            'ignore_above' => 256,
+                        ],
                         // No n-grams: this is what match_phrase_prefix and fuzzy
                         // matching need, because both want real word terms.
                         'folded' => [
@@ -252,15 +307,45 @@ final class ElasticsearchMapping
     /**
      * Prefix-matchable text: n-grams at index time, whole words at search time.
      *
+     * @param array<string, mixed> $fields optional subfields
+     *
      * @return array<string, mixed>
      */
-    private static function autocompleteText(): array
+    private static function autocompleteText(array $fields = []): array
     {
-        return [
+        $mapping = [
             'type' => 'text',
             'analyzer' => self::INDEX_ANALYZER,
             'search_analyzer' => self::SEARCH_ANALYZER,
             'norms' => false,
         ];
+
+        if ($fields !== []) {
+            $mapping['fields'] = $fields;
+        }
+
+        return $mapping;
+    }
+
+    /**
+     * Carried in _source and never searched.
+     *
+     * @param bool $keyword add the exact-value subfield, for aggregating,
+     *                      sorting or collapsing - all of which read doc_values
+     *                      rather than the inverted index
+     *
+     * @return array<string, mixed>
+     */
+    private static function storedText(bool $keyword = false): array
+    {
+        $mapping = ['type' => 'text', 'index' => false];
+
+        if ($keyword) {
+            $mapping['fields'] = [
+                'keyword' => ['type' => 'keyword', 'ignore_above' => 256],
+            ];
+        }
+
+        return $mapping;
     }
 }

@@ -8,6 +8,7 @@ use App\Container;
 use App\Model\SuggestionType;
 use App\Model\SuggestQuery;
 use App\Model\SuggestResult;
+use App\Suggest\ElasticsearchSuggester;
 use App\Suggest\SuggesterInterface;
 use Throwable;
 
@@ -61,6 +62,7 @@ final class SuggestController
         );
 
         $engines = self::engines($params['engine'] ?? null);
+        $explain = self::flag($params['explain'] ?? null, default: false);
 
         // The two engines run one after the other -- PHP has no threads here --
         // but that does not distort the comparison: each suggester measures
@@ -72,7 +74,7 @@ final class SuggestController
         $results = [];
 
         foreach ($engines as $engine) {
-            $results[$engine] = $this->runEngine($engine, $query);
+            $results[$engine] = $this->runEngine($engine, $query, $explain);
         }
 
         return [
@@ -81,6 +83,7 @@ final class SuggestController
             'limit' => $query->limit,
             'types' => $query->typeValues(),
             'fuzzy' => $query->fuzzy,
+            'explain' => $explain,
             'engines' => $results,
             'total_ms' => self::elapsedMs($startedAt),
         ];
@@ -119,7 +122,7 @@ final class SuggestController
      *
      * @return array<string, mixed>
      */
-    private function runEngine(string $engine, SuggestQuery $query): array
+    private function runEngine(string $engine, SuggestQuery $query, bool $explain): array
     {
         $startedAt = hrtime(true);
 
@@ -131,7 +134,18 @@ final class SuggestController
                 return (new SuggestResult($engine, [], 0.0))->toArray();
             }
 
-            return $this->suggester($engine)->suggest($query)->toArray();
+            $suggester = $this->suggester($engine);
+
+            // MySQL reports its ranking components unconditionally - they are a
+            // handful of floats it has already computed. Elasticsearch has to be
+            // asked, and the answer is several times the size of the hit, so it
+            // stays off unless the caller says otherwise. Note this also makes
+            // the request more expensive to serve: never set it while measuring.
+            if ($explain && $suggester instanceof ElasticsearchSuggester) {
+                $suggester->explain = true;
+            }
+
+            return $suggester->suggest($query)->toArray();
         } catch (Throwable $e) {
             // Same keys as SuggestResult::toArray() plus 'error', so the
             // frontend can render a failed column without a second code path.
@@ -210,8 +224,17 @@ final class SuggestController
 
     private static function fuzzy(mixed $value): bool
     {
+        return self::flag($value, default: true);
+    }
+
+    /**
+     * A query-string boolean. Absent means the default; anything falsy-looking
+     * means off, everything else means on.
+     */
+    private static function flag(mixed $value, bool $default): bool
+    {
         if (!is_string($value)) {
-            return true;
+            return $default;
         }
 
         return !in_array(strtolower(trim($value)), ['0', 'false', 'no', 'off'], true);
