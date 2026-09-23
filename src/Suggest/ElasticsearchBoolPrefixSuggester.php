@@ -53,12 +53,22 @@ final class ElasticsearchBoolPrefixSuggester extends AbstractElasticsearchQueryS
     /**
      * The gate, as one match_bool_prefix over the plain whole-word field.
      *
-     * Two shapes, not one, and the second is the one main added for the
-     * incumbent: once the user has moved past the name ("goorbaan 5"), the
-     * trailing locative token is a finished word, and match_bool_prefix would still
-     * match it as a prefix. A plain `match` with operator `and` gates it as the
-     * whole word it is, which is what keeps this method answering the same
-     * question as the other four.
+     * Same clause as es-prefixes, same minimum_should_match, pointed at the
+     * plain whole-word subfield instead of the prefix-indexed one. The two
+     * methods differ in the mapping and nowhere else, which is what makes the
+     * latency difference between them attributable to index_prefixes alone.
+     *
+     * Here the trailing prefix term has no supporting structure, so Lucene
+     * rewrites it into a MultiTermQuery and walks the term dictionary for every
+     * term sharing that prefix. On one- and two-character tokens that is most
+     * of the index. That cost is the measurement, not a defect - see the class
+     * docblock.
+     *
+     * Two shapes, not one: once the user has moved past the name
+     * ("goorbaan 5"), the trailing locative token is a finished word, and
+     * match_bool_prefix would still match it as a prefix. A plain `match` gates
+     * it as the whole word it is, which is what keeps this method answering the
+     * same question as the other four.
      *
      * @param list<string> $wholeWords
      *

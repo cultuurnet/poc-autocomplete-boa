@@ -53,12 +53,26 @@ final class ElasticsearchPrefixesSuggester extends AbstractElasticsearchQuerySug
     /**
      * The gate, as one match_bool_prefix over the index_prefixes field.
      *
-     * Two shapes, not one, and the second is the one main added for the
-     * incumbent: once the user has moved past the name ("goorbaan 5"), the
-     * trailing locative token is a finished word, and match_bool_prefix would still
-     * match it as a prefix. A plain `match` with operator `and` gates it as the
-     * whole word it is, which is what keeps this method answering the same
-     * question as the other four.
+     * `match_bool_prefix` decomposes the query into term queries for every
+     * token except the last, plus a prefix query for the last - which is
+     * exactly the type-ahead reading of the input, and exactly what the
+     * incumbent gets out of its n-gram index. The difference is where the work
+     * happens: with index_prefixes on the field, that trailing prefix query is
+     * served from the hidden _index_prefix term dictionary as another term
+     * lookup instead of expanding into a scan. That single substitution is the
+     * whole method.
+     *
+     * minimum_should_match "100%" is load-bearing. match_bool_prefix builds a
+     * `bool` of `should` clauses and therefore defaults to OR: without this,
+     * "gent kort" would admit every document containing "gent", the gate would
+     * stop being a gate, and the method would look artificially high-recall and
+     * slow for reasons that have nothing to do with index_prefixes.
+     *
+     * Two shapes, not one: once the user has moved past the name
+     * ("goorbaan 5"), the trailing locative token is a finished word, and
+     * match_bool_prefix would still match it as a prefix. A plain `match` gates
+     * it as the whole word it is, which is what keeps this method answering the
+     * same question as the other four.
      *
      * @param list<string> $wholeWords
      *

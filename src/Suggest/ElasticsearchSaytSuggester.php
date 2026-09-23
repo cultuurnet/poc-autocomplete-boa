@@ -48,14 +48,39 @@ final class ElasticsearchSaytSuggester extends AbstractElasticsearchQuerySuggest
     private const ENGINE = 'es-sayt';
 
     /**
+     * The canonical field triple from the Elasticsearch documentation. The
+     * hidden `._index_prefix` is deliberately absent: it is an implementation
+     * detail the query type reaches on its own, and naming it explicitly is a
+     * documented way to get worse scoring.
+     *
+     * @var list<string>
+     */
+    private const GATE_FIELDS = [
+        'search_text_sayt',
+        'search_text_sayt._2gram',
+        'search_text_sayt._3gram',
+    ];
+
+    /** @var list<string> */
+    private const NAME_FIELDS = [
+        'primary_name_sayt',
+        'primary_name_sayt._2gram',
+        'primary_name_sayt._3gram',
+    ];
+
+    public function name(): string
+    {
+        return self::ENGINE;
+    }
+
+    /**
      * The gate, as one bool_prefix multi_match across the shingle family.
      *
-     * Two shapes, not one, and the second is the one main added for the
-     * incumbent: once the user has moved past the name ("goorbaan 5"), the
-     * trailing locative token is a finished word, and a bool_prefix multi_match would still
-     * match it as a prefix. A plain `match` with operator `and` gates it as the
-     * whole word it is, which is what keeps this method answering the same
-     * question as the other four.
+     * Two shapes, not one: once the user has moved past the name
+     * ("goorbaan 5"), the trailing locative token is a finished word, and a
+     * bool_prefix multi_match would still match it as a prefix. A plain `match`
+     * on the root field gates it as the whole word it is, which is what keeps
+     * this method answering the same question as the other four.
      *
      * @param list<string> $wholeWords
      *
@@ -75,6 +100,9 @@ final class ElasticsearchSaytSuggester extends AbstractElasticsearchQuerySuggest
                     'query' => implode(' ', [...$wholeWords, $prefix]),
                     'type' => 'bool_prefix',
                     'fields' => self::GATE_FIELDS,
+                    // bool_prefix is an OR by default, which would turn the gate
+                    // into a suggestion. 100% restores "every token must be
+                    // found", which is what every other method's gate means.
                     'minimum_should_match' => '100%',
                 ],
             ],
