@@ -52,6 +52,60 @@ final class CsvPathOption
     }
 
     /**
+     * Cheap up-front check: one stat plus one line of I/O.
+     *
+     * Everything it rejects would otherwise fail later and worse - either deep
+     * inside a generator or, for a wrong-but-parseable file, not at all. The
+     * header check is also what stops the two exports from being mixed up:
+     * they are both CSVs of Belgian places and neither would obviously
+     * misbehave on the other's columns.
+     *
+     * @param list<string> $expectedHeader
+     */
+    public static function assertUsable(string $path, array $expectedHeader): void
+    {
+        if (!file_exists($path)) {
+            throw new RuntimeException(sprintf(
+                "CSV file not found: %s\n"
+                . 'Relative paths resolve against %s (the project root inside the container).',
+                $path,
+                (string) getcwd(),
+            ));
+        }
+
+        if (is_dir($path)) {
+            throw new RuntimeException(sprintf('CSV path is a directory, not a file: %s', $path));
+        }
+
+        $handle = is_readable($path) ? @fopen($path, 'rb') : false;
+
+        if ($handle === false) {
+            throw new RuntimeException(sprintf(
+                'CSV file exists but cannot be read: %s (check the file permissions).',
+                $path,
+            ));
+        }
+
+        $header = fgetcsv($handle, 0, ',', '"', '');
+        fclose($handle);
+
+        if ($header === false || $header === [null]) {
+            throw new RuntimeException(sprintf('CSV file is empty: %s', $path));
+        }
+
+        if ($header !== $expectedHeader) {
+            throw new RuntimeException(sprintf(
+                "%s does not have the expected header, so its columns cannot be trusted.\n"
+                . "expected: %s\n"
+                . 'found:    %s',
+                $path,
+                implode(',', $expectedHeader),
+                implode(',', array_map(strval(...), $header)),
+            ));
+        }
+    }
+
+    /**
      * --csv/-f wins over CSV_PATH, and null means neither was given — which
      * `health` reports rather than treats as fatal.
      *

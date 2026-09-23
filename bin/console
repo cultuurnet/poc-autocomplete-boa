@@ -6,6 +6,7 @@ declare(strict_types=1);
 use App\Command\BenchmarkCommand;
 use App\Command\HealthCommand;
 use App\Command\ImportCommand;
+use App\Command\ImportPlacesCommand;
 use App\Container;
 use Symfony\Component\Console\Application;
 
@@ -27,13 +28,14 @@ if (!is_file($autoload)) {
 
 require $autoload;
 
-// One container for all three commands: the PDO connection and the
+// One container for all four commands: the PDO connection and the
 // Elasticsearch client are built lazily, so `health` on a half-dead stack still
 // gets far enough to tell you which half is dead.
 $container = new Container();
 
 $application = new Application('poc-autocomplete: MySQL vs Elasticsearch address autocomplete', '1.0.0');
 $application->add(new ImportCommand($container));
+$application->add(new ImportPlacesCommand($container));
 $application->add(new BenchmarkCommand($container));
 $application->add(new HealthCommand($container));
 
