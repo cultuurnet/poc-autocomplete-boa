@@ -116,17 +116,30 @@ final class HealthCommand extends Command
     }
 
     /**
-     * Lazy per engine: constructing both up front means a dead MySQL hides the
-     * state of Elasticsearch, which is exactly what this command must not do.
+     * One row per backend, not per method.
+     *
+     * The five Elasticsearch methods share a client and an index, so their
+     * health() answers are the same answer five times over; this command is
+     * about "is the stack up and does it hold data", which is a property of the
+     * store. Whether an individual method's field is mapped is a question for
+     * `benchmark`, which fails that method loudly and leaves the rest running.
+     *
+     * Still lazy per backend: constructing both up front means a dead MySQL
+     * hides the state of Elasticsearch, which is exactly what this command must
+     * not do.
      *
      * @return array<string, callable(): SuggesterInterface>
      */
     private function suggesters(): array
     {
-        return [
-            'mysql' => $this->container->mysqlSuggester(...),
-            'elasticsearch' => $this->container->elasticsearchSuggester(...),
-        ];
+        $factories = $this->container->suggesters();
+        $backends = [];
+
+        foreach ($this->container->backends() as $backend => $method) {
+            $backends[$backend] = $factories[$method];
+        }
+
+        return $backends;
     }
 
     private function truncate(string $detail): string

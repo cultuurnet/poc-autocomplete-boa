@@ -12,15 +12,19 @@ use App\Suggest\SuggesterInterface;
 use Throwable;
 
 /**
- * Turns query-string parameters into one SuggestQuery and runs it past both
- * engines, returning plain arrays. Nothing here touches the superglobals or
- * writes output: the front controller reads the request once at the edge and
- * JsonResponse does the writing, which keeps this class trivially callable
- * from a test or a CLI harness.
+ * Turns query-string parameters into one SuggestQuery and runs it past every
+ * requested method, returning plain arrays. Nothing here touches the
+ * superglobals or writes output: the front controller reads the request once
+ * at the edge and JsonResponse does the writing, which keeps this class
+ * trivially callable from a test or a CLI harness.
  *
- * The comparison only means something if both engines get a byte-identical
+ * The comparison only means something if every method gets a byte-identical
  * request, so the query is parsed once and the same SuggestQuery instance goes
- * to both.
+ * to all of them.
+ *
+ * Which methods exist is not decided here: Container is the registry, and this
+ * class only validates ?engine= against it. A hardcoded list in a second place
+ * is how the UI ends up offering a method the API rejects.
  */
 final class SuggestController
 {
@@ -36,9 +40,6 @@ final class SuggestController
 
     /** Engine exception messages can carry an entire ES response body. */
     private const MAX_ERROR_LENGTH = 400;
-
-    /** @var list<string> */
-    private const ENGINES = ['mysql', 'elasticsearch'];
 
     public function __construct(private readonly Container $container)
     {
@@ -60,13 +61,15 @@ final class SuggestController
             self::fuzzy($params['fuzzy'] ?? null),
         );
 
-        $engines = self::engines($params['engine'] ?? null);
+        $engines = $this->engines($params['engine'] ?? null);
 
-        // The two engines run one after the other -- PHP has no threads here --
-        // but that does not distort the comparison: each suggester measures
-        // itself with hrtime around its own call, so took_ms is wall time spent
-        // in that engine alone and is unaffected by what ran before it. The
-        // total below is the only number that includes both plus PHP overhead.
+        // The engines run one after the other -- PHP has no threads here -- but
+        // that does not distort the comparison: each suggester measures itself
+        // with hrtime around its own call, so took_ms is wall time spent in
+        // that engine alone and is unaffected by what ran before it. The total
+        // below is the only number that includes all of them plus PHP overhead.
+        // It does mean ?engine=all is six sequential round trips, which is why
+        // the UI asks for one method per request instead of batching them.
         $startedAt = hrtime(true);
 
         $results = [];
@@ -89,18 +92,33 @@ final class SuggestController
     /**
      * GET /api/health
      *
+     * Reports *backends*, not methods. The five Elasticsearch methods share one
+     * client and one index, so checking all five would be five round trips that
+     * can only ever answer the same question -- is the cluster up and does the
+     * index hold documents -- while making the health strip five times longer
+     * for no extra information. The per-method truth that a backend check
+     * cannot give you (is this method's field actually mapped?) shows up the
+     * moment you query the method, as that column's error string.
+     *
+     * The 'engines' key therefore keeps its original shape and its original two
+     * entries: the health strip in app.js indexes straight into it, and the
+     * point of the key is the backend health it has always reported.
+     *
+     * 'methods' is the registry, so the picker can be built from one request
+     * that the UI already makes rather than from a hardcoded copy in app.js.
+     *
      * @return array<string, mixed>
      */
     public function health(): array
     {
         $engines = [];
 
-        foreach (self::ENGINES as $engine) {
+        foreach ($this->container->backends() as $backend => $method) {
             try {
-                $engines[$engine] = ['engine' => $engine] + $this->suggester($engine)->health();
+                $engines[$backend] = ['engine' => $backend] + $this->suggester($method)->health();
             } catch (Throwable $e) {
-                $engines[$engine] = [
-                    'engine' => $engine,
+                $engines[$backend] = [
+                    'engine' => $backend,
                     'ok' => false,
                     'detail' => self::errorMessage($e),
                     'documents' => 0,
@@ -108,7 +126,10 @@ final class SuggestController
             }
         }
 
-        return ['engines' => $engines];
+        return [
+            'engines' => $engines,
+            'methods' => $this->container->methods(),
+        ];
     }
 
     /**
@@ -148,17 +169,15 @@ final class SuggestController
     }
 
     /**
-     * Deliberately not Container::suggesters(): that builds both, so a dead
-     * MySQL would throw before the Elasticsearch suggester ever exists. Each
-     * engine is constructed inside its own try block instead, because
-     * connecting is itself one of the failures worth showing in a column.
+     * One method, built on demand. Container::suggesters() hands back factories
+     * rather than instances precisely so this call can happen inside the
+     * per-engine try block above: a dead MySQL must not throw before the
+     * Elasticsearch methods exist, and connecting is itself one of the failures
+     * worth showing in a column rather than in a 500.
      */
     private function suggester(string $engine): SuggesterInterface
     {
-        return match ($engine) {
-            'mysql' => $this->container->mysqlSuggester(),
-            'elasticsearch' => $this->container->elasticsearchSuggester(),
-        };
+        return $this->container->suggester($engine);
     }
 
     private static function rawQuery(mixed $value): string
@@ -218,22 +237,31 @@ final class SuggestController
     }
 
     /**
-     * Accepts "all", one engine, or a comma separated subset. Anything
-     * unrecognised falls back to both rather than 400-ing: this endpoint is
-     * driven by a URL people hand-edit while poking at the POC.
+     * Accepts "all", one method key, or a comma separated subset. Anything
+     * unrecognised falls back to the full registry rather than 400-ing: this
+     * endpoint is driven by a URL people hand-edit while poking at the POC, and
+     * a typo that shows you everything is friendlier than one that shows you an
+     * error page.
+     *
+     * The intersection is taken registry-first, so the response always lists
+     * the engines in the canonical order no matter what order the caller asked
+     * for them in -- the UI renders columns straight from that order and should
+     * not have them jump around between requests.
      *
      * @return list<string>
      */
-    private static function engines(mixed $value): array
+    private function engines(mixed $value): array
     {
+        $all = $this->container->methodKeys();
+
         if (!is_string($value) || trim($value) === '' || strtolower(trim($value)) === 'all') {
-            return self::ENGINES;
+            return $all;
         }
 
         $requested = array_map(static fn (string $e): string => strtolower(trim($e)), explode(',', $value));
-        $engines = array_values(array_intersect(self::ENGINES, $requested));
+        $engines = array_values(array_intersect($all, $requested));
 
-        return $engines === [] ? self::ENGINES : $engines;
+        return $engines === [] ? $all : $engines;
     }
 
     private static function elapsedMs(int $startedAt): float
