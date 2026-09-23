@@ -10,7 +10,8 @@
         },
         "matching_rule": "An expectation that starts with 'street:', 'address:', 'municipality:' or 'postcode:' is compared against the suggestion id, exactly. Anything else is compared case-insensitively as a substring of the suggestion label. Use an id when exactly one document is correct; use a label substring when a whole family of documents would be an acceptable answer.",
         "expect_semantics": "The 'expect' list holds alternatives, not a set to retrieve in full: an entry counts as a hit at k when any expectation matches any of the top k suggestions. MRR uses the rank of the first matching suggestion.",
-        "index_level": "All expectations sit at street / municipality / postcode level, so the set scores correctly against a default `import --level=street` run. Nothing here needs the 4.2M address-level import."
+        "index_level": "All expectations sit at street / municipality / postcode level, so the set scores correctly against a default `import --level=street` run. Nothing here needs the 4.2M address-level import.",
+        "house_numbers": "The entries carrying a house number or a box reference expect the street document, not an address: a street-level index holds no number, and the split in SuggestQuery exists precisely so that typing one cannot empty the result set. Three of them (\"kerkstraat 12 9000 gent\", \"goorbaan 59 2230 herselr\", \"grote markt 1 2000 antwrepen\") reach an answer only through the fuzzy fallback and returned nothing before 1f324db. Keep at least those three: the set held no query with a number in it at all, which is how that regression survived c93ecc8."
     },
     "entries": [
         {
@@ -162,6 +163,41 @@
             "query": "kerkstraat",
             "expect": ["Kerkstraat,"],
             "note": "Label-substring expectation rather than an id: with hundreds of Kerkstraten and no second token, any Kerkstraat is a defensible top hit. What is being checked is that the engine returns a street named Kerkstraat first, and not a municipality, a postcode, or a street that merely contains the word."
+        },
+        {
+            "query": "goorbaan 59",
+            "expect": ["street:14602|2230"],
+            "note": "A house number on a street that is unique in Flanders. No street document carries a number, so the only right answer is the street itself - the number has to rank, never gate."
+        },
+        {
+            "query": "goorbaan 59 2230 herselt",
+            "expect": ["street:14602|2230"],
+            "note": "The full shape a geocoding lookup arrives in: street, number, postcode and municipality, all correct. Still one document, still the street."
+        },
+        {
+            "query": "veldstraat 10 9000 gent",
+            "expect": ["street:71854|9000"],
+            "note": "The same shape in a city where the street name is far from unique. The postcode does the narrowing and the house number must not undo it."
+        },
+        {
+            "query": "kerkstraat 12 bus 5 gent",
+            "expect": ["street:70662|9050"],
+            "note": "House number plus box reference. \"bus\" is in no haystack at any level - SuggestionDocument::searchText() never writes box_number - so requiring it finds nothing at all."
+        },
+        {
+            "query": "kerkstraat 12 9000 gent",
+            "expect": ["street:70662|9050"],
+            "note": "No Kerkstraat carries postcode 9000, so the strict gate comes back empty and the fuzzy fallback has to answer. Regression guard for 1f324db: that fallback re-required the house number and returned nothing, while the same query without the 12 returned three."
+        },
+        {
+            "query": "goorbaan 59 2230 herselr",
+            "expect": ["street:14602|2230"],
+            "note": "A typo in the municipality together with a house number - the combination that reaches the fallback with detail tokens still attached. Zero results before 1f324db."
+        },
+        {
+            "query": "grote markt 1 2000 antwrepen",
+            "expect": ["street:1064|2000"],
+            "note": "The same failure on a transposition rather than a substitution, which is what fuzzy_transpositions exists for. Zero results before 1f324db."
         }
     ]
 }
