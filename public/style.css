@@ -336,6 +336,70 @@ kbd {
   pointer-events: none;
 }
 
+/* Sits after the caret drawn by .column-title::after, so it needs its own
+   left margin rather than inheriting the negative one above. */
+.method-help-toggle {
+  flex: none;
+  width: 1.05rem;
+  height: 1.05rem;
+  margin-left: 0.5rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.68rem;
+  font-weight: 650;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.method-help-toggle:hover {
+  background: var(--panel-2);
+  color: var(--ink);
+}
+
+.method-help-toggle[aria-expanded="true"] {
+  background: var(--panel-2);
+  border-color: currentColor;
+  color: inherit;
+}
+
+.method-help-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Spans the head like .method-note, so opening it pushes the results down
+   rather than covering the first one - the whole point is reading it next to
+   the results it explains. */
+.method-help {
+  flex-basis: 100%;
+  margin: 0.15rem 0 0;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--line);
+  border-left: 2px solid currentColor;
+  border-radius: 4px;
+  background: var(--panel-2);
+  color: var(--ink);
+  font-size: 0.75rem;
+  line-height: 1.45;
+  font-weight: 400;
+}
+
+.method-help p { margin: 0.2rem 0 0; }
+
+.method-help-title {
+  color: inherit;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
 /* One line, and only for methods that would otherwise be read as a
    like-for-like quality result. It spans the head so the stats keep their
    row. */

@@ -65,6 +65,36 @@ const FALLBACK_METHODS = [
  * and it must not change wording because a server-side description was
  * reworded. Only methods that would otherwise be misread need an entry.
  */
+/**
+ * Plain-language answers to "what is this one, then?", behind the ? button.
+ *
+ * Client-side for the same reason as METHOD_NOTES below: this has to be right
+ * on the first paint, before any request has answered. Deliberately not the
+ * same text as the server's one-line `description` - that one names the
+ * Elasticsearch feature for someone who already knows what it is, this one is
+ * for someone comparing two columns and wondering why they differ.
+ */
+const METHOD_EXPLAINERS = {
+  mysql:
+    'The plain database option: MySQL keeps an index of the words in every address and returns the rows containing all of them, with the last word matched as the start of a word. '
+    + 'The ranking is a hand-written formula, and it has no typo tolerance of its own.',
+  elasticsearch:
+    'Every name is chopped up into all of its beginnings when it is stored, so "Gent" is stored as g, ge, gen and gent. '
+    + 'Typing a few letters is then just a direct lookup, which is quick - but storing all those fragments makes the index several times bigger.',
+  'es-prefixes':
+    'The same idea as the edge n-gram method, except Elasticsearch builds and maintains the list of beginnings itself instead of us configuring it by hand. '
+    + 'Less to get wrong, and it has no limit on how long a name can be.',
+  'es-sayt':
+    'A ready-made Elasticsearch field type meant exactly for search-as-you-type. '
+    + 'It also stores neighbouring words in pairs and triples, so it is good at half-typed phrases - but it has the largest index of the five by some margin.',
+  'es-bool-prefix':
+    'No special index at all: Elasticsearch looks up the words you finished typing the normal way, and scans for everything starting with the last one. '
+    + 'Nothing extra to store, and the scan only really costs anything when you have typed just one or two letters.',
+  'es-completion':
+    'A separate, purpose-built dictionary of names that is by far the fastest of the five. '
+    + 'The catch is that it only matches from the beginning of a single name - "kerkstraat gent" finds nothing - and it orders results purely by how big the place is.',
+};
+
 const METHOD_NOTES = {
   'es-completion': 'Ranks on indexed popularity alone: no multi-token reordering, no house numbers, no meaningful total.',
 };
@@ -95,6 +125,8 @@ for (const column of COLUMNS) {
     head: root.querySelector('.column-head'),
     select: root.querySelector('.method-select'),
     note: root.querySelector('.method-note'),
+    helpToggle: root.querySelector('.method-help-toggle'),
+    help: root.querySelector('.method-help'),
     fastest: root.querySelector('.fastest'),
     server: root.querySelector('.stat-server'),
     client: root.querySelector('.stat-client'),
@@ -509,6 +541,33 @@ function applyMethodToDom(column) {
 
   ui.note.hidden = note === null;
   ui.note.textContent = note ?? '';
+
+  // The panel is rebuilt on every method change but its open/closed state is
+  // left alone: someone stepping through the methods to read about each one
+  // should not have to reopen it five times.
+  ui.help.replaceChildren(
+    el('strong', 'method-help-title', method?.label ?? key),
+    el('p', null, METHOD_EXPLAINERS[key] ?? 'No description available for this method.'),
+  );
+}
+
+/**
+ * Show or hide one column's explanation panel.
+ *
+ * A panel rather than a window.alert(): an alert blocks the whole page, so you
+ * could not read the explanation while looking at the results it is explaining,
+ * which is the only reason to open it.
+ */
+function toggleMethodHelp(column, open) {
+  const ui = dom.columns[column];
+  const show = open ?? ui.help.hidden;
+
+  ui.help.hidden = !show;
+  ui.helpToggle.setAttribute('aria-expanded', String(show));
+}
+
+function closeAllMethodHelp() {
+  COLUMNS.forEach((column) => toggleMethodHelp(column, false));
 }
 
 /**
@@ -986,6 +1045,14 @@ function onKeydown(event) {
   if (event.key === 'Escape') {
     event.preventDefault();
 
+    // Innermost thing first: a panel the user just opened is what they meant
+    // to close, not the query they spent five keystrokes typing.
+    if (COLUMNS.some((column) => !dom.columns[column].help.hidden)) {
+      closeAllMethodHelp();
+
+      return;
+    }
+
     if (hasHighlight()) {
       state.cursor = { left: -1, right: -1 };
       COLUMNS.forEach(applyCursor);
@@ -1023,8 +1090,18 @@ for (const column of COLUMNS) {
 
   ui.select.addEventListener('change', () => selectMethod(column, ui.select.value));
   ui.root.addEventListener('mousedown', () => switchColumn(column));
+
+  ui.helpToggle.addEventListener('click', (event) => {
+    // Without this the document-level handler below closes the panel again in
+    // the same click that opened it.
+    event.stopPropagation();
+    toggleMethodHelp(column);
+  });
+
+  ui.help.addEventListener('click', (event) => event.stopPropagation());
 }
 
+document.addEventListener('click', closeAllMethodHelp);
 document.addEventListener('keydown', onKeydown);
 dom.unpin.addEventListener('click', unpin);
 

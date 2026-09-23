@@ -83,6 +83,12 @@
         <select class="method-select" aria-label="Method shown in the left column">
           <option value="mysql">MySQL</option>
         </select>
+        <button
+          type="button"
+          class="method-help-toggle"
+          aria-expanded="false"
+          aria-label="What does this method do?"
+          title="What does this method do?">?</button>
       </h2>
       <span class="fastest" hidden>fastest</span>
       <dl class="stats">
@@ -91,6 +97,7 @@
         <div><dt>results</dt><dd class="stat-count">&ndash;</dd></div>
       </dl>
       <p class="method-note" hidden></p>
+      <div class="method-help" role="note" hidden></div>
     </header>
     <p class="engine-error" hidden></p>
     <ol class="results"></ol>
@@ -103,6 +110,12 @@
         <select class="method-select" aria-label="Method shown in the right column">
           <option value="elasticsearch">ES edge n-gram</option>
         </select>
+        <button
+          type="button"
+          class="method-help-toggle"
+          aria-expanded="false"
+          aria-label="What does this method do?"
+          title="What does this method do?">?</button>
       </h2>
       <span class="fastest" hidden>fastest</span>
       <dl class="stats">
@@ -111,6 +124,7 @@
         <div><dt>results</dt><dd class="stat-count">&ndash;</dd></div>
       </dl>
       <p class="method-note" hidden></p>
+      <div class="method-help" role="note" hidden></div>
     </header>
     <p class="engine-error" hidden></p>
     <ol class="results"></ol>

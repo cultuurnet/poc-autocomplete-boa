@@ -246,7 +246,9 @@ Exits non-zero if either engine is unhealthy. The same information is available 
 method picker above it**, so the comparison is any method against any other — MySQL against
 the incumbent Elasticsearch query as before, or two Elasticsearch methods against each other.
 Both choices are remembered in `localStorage`, and changing one re-runs only that column and
-resets only that column's rolling median (a median mixing two methods would be a lie).
+resets only that column's rolling median (a median mixing two methods would be a lie). The **?** next
+to a column's method name explains in two or three plain sentences what that method actually
+does, which is the difference between reading the comparison and guessing at it.
 
 Per keystroke it shows, for each column:
 
