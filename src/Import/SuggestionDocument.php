@@ -64,4 +64,51 @@ final class SuggestionDocument
             ? (string) $this->postcode
             : $this->municipalityName);
     }
+
+    /**
+     * The strings a user would type meaning "this document", for the
+     * Elasticsearch completion suggester.
+     *
+     * Deliberately *not* searchText(): the completion FST matches a prefix of a
+     * whole input, never a word in the middle of one, so feeding it the joined
+     * haystack would mean "gent" only completes documents whose haystack starts
+     * with "gent" - the postcode and house number would swallow everything
+     * else. Each name has to be its own input instead, which is also why the
+     * aliases are listed separately rather than concatenated: "Liège" and
+     * "Luik" are two things a user types, not one.
+     *
+     * Text is handed over unfolded on purpose. The completion field carries the
+     * folding analyser, so Elasticsearch folds it the same way every other field
+     * is folded, and the raw form is what the suggester echoes back as the
+     * matched text.
+     *
+     * @return list<string> non-empty, deduplicated, primary name first
+     */
+    public function completionInputs(): array
+    {
+        $inputs = [];
+        $seen = [];
+
+        foreach ([$this->primaryName(), ...$this->aliases] as $input) {
+            $input = trim($input);
+
+            // An empty input makes Elasticsearch reject the whole document, and
+            // duplicates (a street whose alias repeats its name) would cost FST
+            // entries without ever changing a result.
+            //
+            // The seen-set is kept beside the list rather than being the list:
+            // a postcode document's primary name is "2230", and PHP would turn
+            // that array key back into the *integer* 2230, which json_encode
+            // then writes as a bare number and the completion field rejects as
+            // a non-string input. Appending to a real list keeps the type.
+            if ($input === '' || isset($seen[$input])) {
+                continue;
+            }
+
+            $seen[$input] = true;
+            $inputs[] = $input;
+        }
+
+        return $inputs;
+    }
 }
