@@ -231,6 +231,10 @@ final class BenchmarkCommand extends Command
         array &$captured,
         array &$errors,
     ): void {
+        // Read once, not per query: it is a property of the index the run is
+        // pointed at, and it must not change halfway through a measurement.
+        $houseNumbers = $this->container->config->houseNumbersIndexed;
+
         foreach (array_keys($suggesters) as $engine) {
             $samples[$engine] = [];
             $captured[$engine] = [];
@@ -244,7 +248,7 @@ final class BenchmarkCommand extends Command
             foreach ($suggesters as $suggester) {
                 for ($i = 0; $i < $warmup; ++$i) {
                     try {
-                        $suggester->suggest(new SuggestQuery($query, $limit, [], $fuzzy));
+                        $suggester->suggest(new SuggestQuery($query, $limit, [], $fuzzy, $houseNumbers));
                     } catch (Throwable) {
                         // Counted below, during the timed runs.
                     }
@@ -258,7 +262,7 @@ final class BenchmarkCommand extends Command
             foreach ($queries as $query) {
                 foreach ($suggesters as $engine => $suggester) {
                     try {
-                        $result = $suggester->suggest(new SuggestQuery($query, $limit, [], $fuzzy));
+                        $result = $suggester->suggest(new SuggestQuery($query, $limit, [], $fuzzy, $houseNumbers));
                     } catch (Throwable $e) {
                         ++$errors[$engine];
                         $this->recordError($engine, $query, $e);
@@ -319,10 +323,12 @@ final class BenchmarkCommand extends Command
         array &$captured,
         array &$errors,
     ): void {
+        $houseNumbers = $this->container->config->houseNumbersIndexed;
+
         foreach ($queries as $query) {
             foreach ($suggesters as $engine => $suggester) {
                 try {
-                    $captured[$engine][$query] = $suggester->suggest(new SuggestQuery($query, $limit, [], $fuzzy))->suggestions;
+                    $captured[$engine][$query] = $suggester->suggest(new SuggestQuery($query, $limit, [], $fuzzy, $houseNumbers))->suggestions;
                 } catch (Throwable $e) {
                     ++$errors[$engine];
                     $this->recordError($engine, $query, $e);

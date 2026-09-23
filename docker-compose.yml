@@ -17,6 +17,9 @@ services:
       MYSQL_TABLE: location_suggestions
       ELASTICSEARCH_HOST: http://elasticsearch:9200
       ELASTICSEARCH_INDEX: location_suggestions
+      # Set to 1 when the index was built with --level=address or --level=all,
+      # so a typed house number narrows the search instead of only ranking it.
+      HOUSE_NUMBERS_INDEXED: "${HOUSE_NUMBERS_INDEXED:-0}"
     depends_on:
       mysql:
         condition: service_healthy

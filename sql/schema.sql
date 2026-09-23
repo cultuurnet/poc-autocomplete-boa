@@ -53,8 +53,15 @@ CREATE TABLE IF NOT EXISTS `{{table}}` (
     `place_name`        VARCHAR(255) NULL,
 
     `street_name`       VARCHAR(255) NULL,
-    `house_number`      VARCHAR(16)  NULL,
-    `box_number`        VARCHAR(16)  NULL,
+    -- 64, not 16: the register is a free-text field in disguise. At
+    -- house-number level three rows in 3.9M carry a box reference that is a
+    -- phrase rather than a number ("gemeenschappelijk", "0002-1ste verdiep"),
+    -- and at VARCHAR(16) those three abort the whole MySQL import two thirds
+    -- of the way through. Elasticsearch accepted them silently, so the two
+    -- engines had silently different corpora until an address-level import
+    -- made it visible.
+    `house_number`      VARCHAR(64)  NULL,
+    `box_number`        VARCHAR(64)  NULL,
     `postcode`          CHAR(4)      NULL,
     `post_name`         VARCHAR(128) NULL,
     `municipality_name` VARCHAR(128) NOT NULL,

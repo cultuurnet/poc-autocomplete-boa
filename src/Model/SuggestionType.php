@@ -61,8 +61,18 @@ enum SuggestionType: string
     public function rankTier(): int
     {
         return match ($this) {
-            self::Municipality, self::Postcode, self::Place => 0,
-            self::Street, self::Address => 1,
+            self::Municipality, self::Postcode => 0,
+            // Place gets a tier of its own rather than sharing either
+            // neighbour. Sharing tier 0 made any matching place outrank every
+            // street unconditionally - on "kerkstraat gent" the Kerkstraat
+            // itself came fifth, behind four venues that happen to stand in it
+            // and score a third as well - because rank_tier sorts before
+            // _score. Sharing tier 2 would leave the choice to the 1.2 weight
+            // in scoringFunctions(), which a strong street match can overrun.
+            // Between the two: a venue still beats the street it stands on,
+            // but never the town it stands in.
+            self::Place => 1,
+            self::Street, self::Address => 2,
         };
     }
 

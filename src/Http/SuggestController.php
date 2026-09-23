@@ -60,6 +60,7 @@ final class SuggestController
             self::limit($params['limit'] ?? null),
             self::types($params['types'] ?? null),
             self::fuzzy($params['fuzzy'] ?? null),
+            $this->container->config->houseNumbersIndexed,
         );
 
         $engines = $this->engines($params['engine'] ?? null);

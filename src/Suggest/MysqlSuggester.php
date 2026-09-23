@@ -753,8 +753,13 @@ final class MysqlSuggester implements SuggesterInterface
         }
 
         // The ELSE cannot be reached through this application, but a row written
-        // by an older version of the code should sort last rather than first.
-        return sprintf('CASE `doc_type`%s ELSE 1 END', $cases);
+        // by an older version of the code should sort last rather than first,
+        // which means one past the highest tier the enum currently defines
+        // rather than a hardcoded number that silently becomes "first" the next
+        // time a tier is added.
+        $last = max(array_map(static fn (SuggestionType $t): int => $t->rankTier(), SuggestionType::cases())) + 1;
+
+        return sprintf('CASE `doc_type`%s ELSE %d END', $cases, $last);
     }
 
     /**

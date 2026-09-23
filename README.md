@@ -512,26 +512,86 @@ cannot see house numbers, and returns no meaningful total. It is in the comparis
 latency floor — the number that says what the other four are paying for their flexibility —
 and not as a candidate.
 
+### House numbers: `HOUSE_NUMBERS_INDEXED`
+
+The locative/detail split in `SuggestQuery` — house numbers and box references are kept out of
+the recall gate and only allowed to influence ranking — was written against a **street-level**
+index, where it is not a heuristic but a necessity: no document carries a house number, so
+requiring `12` returns nothing for `kerkstraat 12 gent`, which is a completely ordinary way to
+write an address.
+
+Build the index with `--level=address` or `--level=all` and that premise is simply false. The
+number becomes the most selective thing the user typed, and demoting it to a ranking signal
+buries the one document they asked for. So the logic is not dead code to delete; it belongs to
+one shape of index. `HOUSE_NUMBERS_INDEXED` names which shape you have.
+
+Measured on the 4,029,990-document index, top hit and number of candidates admitted by the
+gate:
+
+| query | `=0` (the default) | `=1` |
+|---|---|---|
+| `kerkstraat 12 gent` | 413 candidates → *Junior Argonauts Gentbrugge* | **2** → **Kerkstraat 12, 9050 Gent** |
+| `veldstraat 10 9000 gent` | 112 → *Fnac Gent* | **1** → **Veldstraat 10, 9000 Gent** |
+| `goorbaan 59 2230 herselt` | 45 → *Goorbaan* (the street) | **1** → **Goorbaan 59, 2230 Herselt** |
+| `grote markt 1 2000 antwerpen` | 139 → *Antwerpen - Grote Markt* | **6** → **Grote markt 1, 2000 Antwerpen** |
+| `goorbaan 59` | 45 → Goorbaan 59 (already correct) | 2 → Goorbaan 59 |
+| `gent`, `12` | unchanged | unchanged |
+
+**Box references are excluded from the gate either way**, and that is not an oversight:
+`SuggestionDocument` never writes `box_number` into `search_text`, so gating on `bus 5` matches
+nothing by construction. The first cut of this flag got that wrong and turned
+`kerkstraat 12 bus 5 gent` into zero results — a worse failure than the one it was fixing.
+`SuggestQuery::detailIndices()` now distinguishes the two: the house number is detail only
+while the index lacks house numbers, the box reference is detail always, and the token after a
+box marker goes with it.
+
+Default `0`, because `--level=street` is the import default. Getting it wrong is not fatal in
+either direction: `0` on an address index costs precision, `1` on a street index costs recall
+on any query containing a number. Set it in `.env` or the environment:
+
+```bash
+HOUSE_NUMBERS_INDEXED=1 docker compose up -d
+```
+
+Nothing about this is Elasticsearch-specific — the flag lives in `SuggestQuery`, so all five
+Elasticsearch methods and MySQL see the same split.
+
 ### What the methods cost to index
 
-Same 82,643 documents (street level), force-merged to one segment, measured with
-`POST /<index>/_disk_usage?run_expensive_tasks=true`:
+Measured twice: at **street level** (82,643 documents, `--level=street`) and at **address
+level** (4,029,990 documents — the full house-number file plus the UiTdatabank places), both
+force-merged to one segment and measured with
+`POST /<index>/_disk_usage?run_expensive_tasks=true`.
 
-| | index size | import wall clock |
+| | street level, 82,643 docs | address level, 4,029,990 docs |
 |---|---|---|
-| incumbent only (the mapping before this change) | 40.8 MB | 23.9 s |
-| all five methods in one index | 107.5 MB | 39.3 s |
+| index size, incumbent mapping only | 40.8 MB | — |
+| index size, all five methods | 107.5 MB | **3.5 GB** |
+| Elasticsearch write time | 39.3 s (2,102 docs/s) | **1,131.9 s (3,505 docs/s)** |
+| MySQL write time | — | 305.0 s (13,007 docs/s) |
 
-That 2.6× is the cost of being able to *compare*, not the cost of shipping any one method.
+**This is the part worth pausing on.** 49× the documents costs 33× the index and 29× the
+import. Elasticsearch writes *faster per document* at address level (3,505/s against 2,102/s)
+because an address document carries far less text than an aggregated street document — the
+cost is volume, not complexity. But it is still **3.7× slower than MySQL** on the same
+documents in the same pass, and that gap is entirely the five methods' index-time machinery:
+edge n-grams, two prefix indexes, the shingle family and the FST all have to be built for
+every one of those four million documents. A nineteen-minute import is a different operational
+proposition from a forty-second one.
+
 Per method, the fields it alone needs:
 
-| method | fields | MB |
-|---|---|---|
-| `es-bool-prefix` | — (reuses `search_text.folded`, `primary_name.folded`) | **0.0** |
-| `es-completion` | `suggest` | 6.1 |
-| `elasticsearch` | `search_text` 8.4 + `primary_name` 4.5 | 12.9 |
-| `es-prefixes` | the two `._index_prefix` structures, 8.4 + 4.5 | 12.9 |
-| `es-sayt` | eight subfields; `search_text_sayt._index_prefix` alone is 24.1 | 38.8 |
+| method | fields | street level | address level |
+|---|---|---|---|
+| `es-bool-prefix` | — (reuses `search_text.folded`, `primary_name.folded`) | **0.0 MB** | **0 MB** |
+| `es-completion` | `suggest` | 6.1 MB | 253 MB |
+| `elasticsearch` | `search_text` + `primary_name` | 12.9 MB | 376 MB |
+| `es-prefixes` | the two `._index_prefix` structures | 12.9 MB | 376 MB |
+| `es-sayt` | eight subfields; `search_text_sayt._index_prefix` alone is 904 MB | 38.8 MB | 1,299 MB |
+
+The proportions survive the change of scale almost exactly, which is the useful part: these
+ratios are a property of the methods, not of this corpus. `search_as_you_type` is a third of
+the whole index at both sizes.
 
 Two things worth stating plainly, because this README previously guessed at both:
 
@@ -547,22 +607,33 @@ Two things worth stating plainly, because this README previously guessed at both
 ### What the methods cost to query
 
 106 queries × 20 iterations, engine-reported `took`, single node, single shard, warm, nothing
-else running:
+else running. Street level on the left, address level on the right — same queries, same
+machine, 49× the documents:
 
-| method | p50 | p90 | p95 | p99 | max |
-|---|---|---|---|---|---|
-| `elasticsearch` | 2.41 | 4.02 | 5.04 | 8.55 | 62.20 |
-| `es-prefixes` | 2.29 | 3.96 | 5.12 | 7.83 | 36.62 |
-| `es-sayt` | 2.31 | 3.80 | 4.73 | 8.51 | 21.95 |
-| `es-bool-prefix` | 2.32 | 3.93 | 5.07 | 8.45 | 33.22 |
-| `es-completion` | **1.11** | 1.62 | 1.96 | 4.10 | 17.81 |
+| method | p50 | p95 | max | | p50 | p95 | max |
+|---|---|---|---|---|---|---|---|
+| | *82,643 docs* | | | | *4,029,990 docs* | | |
+| `elasticsearch` | 2.41 | 5.04 | 62.20 | | 2.91 | 5.31 | 18.79 |
+| `es-prefixes` | 2.29 | 5.12 | 36.62 | | 2.56 | 4.64 | 17.30 |
+| `es-sayt` | 2.31 | 4.73 | 21.95 | | 2.58 | 4.88 | 23.18 |
+| `es-bool-prefix` | 2.32 | 5.07 | 33.22 | | 2.70 | 5.85 | **39.25** |
+| `es-completion` | **1.11** | 1.96 | 17.81 | | **0.69** | 0.96 | 8.16 |
 
-**At this corpus size the four search methods are indistinguishable.** The method with no
-prefix index at all is as fast at the median as the one paying 12.9 MB for one. That is the
-single most useful result here, and it is not the result the article leads you to expect.
+**Fifty times the corpus costs about 15% at the median.** That is the headline, and it is the
+opposite of the indexing story above: writing four million documents is a nineteen-minute job,
+but querying them is barely distinguishable from querying eighty thousand. Inverted indexes do
+not care much how many documents they do *not* have to look at.
 
-It is not a licence to delete the n-grams, for two reasons. The first is visible in the
-by-length breakdown (median of each query's p50):
+**At both sizes the four search methods are within noise of each other at the median.** The
+method with no prefix index at all is as fast as the one paying 376 MB for one. That is not
+the result the article leads you to expect.
+
+It is still not a licence to delete the n-grams, and scale sharpens the reason: `es-bool-prefix`
+now has the worst p95 (5.85 against 4.64) and the worst tail by a factor of two (39.25 ms).
+The scan it does instead of a lookup is invisible at the median and shows up exactly where the
+article says it will — in the tail, and on the shortest prefixes:
+
+*Street level, 82,643 documents:*
 
 | query length | `elasticsearch` | `es-prefixes` | `es-sayt` | `es-bool-prefix` | `es-completion` |
 |---|---|---|---|---|---|
@@ -571,33 +642,61 @@ by-length breakdown (median of each query's p50):
 | 3–5 chars | 1.45 | 1.30 | 1.34 | 1.27 | 1.04 |
 | 6+ chars | 2.52 | 2.38 | 2.45 | 2.32 | 1.08 |
 
-The scan only shows up where the article says it will — on the shortest prefixes, where the
-term dictionary walk is widest — and at 82k documents it costs about a millisecond. The
-second reason is that **this was measured at street level, 82,643 documents**. The article's
-warning is about scale, and `--level=address` (3.9M documents) is where it would bite. That
-run has not been done; until it has, "the prefix scan is free" is a statement about this
-corpus and not about this problem.
+*Address level, 4,029,990 documents:*
+
+| query length | `elasticsearch` | `es-prefixes` | `es-sayt` | `es-bool-prefix` | `es-completion` |
+|---|---|---|---|---|---|
+| 1 char | 2.05 | 1.83 | 1.89 | **6.64** | 0.65 |
+| 2 chars | 2.96 | 2.87 | 2.95 | **5.10** | 0.63 |
+| 3–5 chars | 2.03 | 2.00 | 2.00 | 1.99 | 0.65 |
+| 6+ chars | 3.05 | 2.69 | 2.73 | 2.69 | 0.71 |
+
+**There it is.** On a one-character query the unindexed scan goes from 1.3× slower than the
+indexed methods at street level to **3.2× slower** at address level — 6.64 ms against 1.83 —
+while the three indexed methods actually get *faster* on short prefixes at the larger corpus.
+Two characters show the same shape at 1.8×. Everything from three characters up is identical,
+because by then the term dictionary walk is narrow enough not to matter.
+
+The worst single query per method says the same thing: `es-bool-prefix` peaks at 12.77 ms on
+`"k"`, while the other three peak on long multi-word queries where the scan plays no part.
+
+So the article is right, and it is right about precisely the case it names: a prefix query
+with nothing behind it degrades with corpus size, and it degrades first on the keystroke every
+user types. It just costs far less than the framing suggests — 5 ms on four million documents,
+on one shard, on a laptop.
 
 ### Whether the methods are any good
 
 Against the hand-curated golden set (37 known-item queries with expected answers):
 
-| method | hit@1 | hit@3 | hit@10 | MRR |
-|---|---|---|---|---|
-| `es-bool-prefix` | **35 (95%)** | 35 | 37 (100%) | **0.957** |
-| `elasticsearch` | 34 (92%) | 35 | 37 (100%) | 0.943 |
-| `es-prefixes` | 34 (92%) | 35 | 37 (100%) | 0.943 |
-| `es-sayt` | 33 (89%) | 35 | 37 (100%) | 0.929 |
-| `es-completion` | 13 (35%) | 14 | 14 (38%) | 0.365 |
+| method | hit@1 | hit@10 | MRR (street) | | hit@1 | hit@10 | MRR (address) |
+|---|---|---|---|---|---|---|---|
+| `es-bool-prefix` | **35 (95%)** | 37 (100%) | **0.957** | | 17 (46%) | 28 (76%) | **0.546** |
+| `elasticsearch` | 34 (92%) | 37 (100%) | 0.943 | | 16 (43%) | 27 (73%) | 0.519 |
+| `es-prefixes` | 34 (92%) | 37 (100%) | 0.943 | | 17 (46%) | 28 (76%) | 0.541 |
+| `es-sayt` | 33 (89%) | 37 (100%) | 0.929 | | 17 (46%) | 28 (76%) | 0.542 |
+| `es-completion` | 13 (35%) | 14 (38%) | 0.365 | | 9 (24%) | 10 (27%) | 0.257 |
+
+**Do not read the address-level column as "the methods got worse".** The golden set expects
+`street:` documents, and at address level two other things now outrank them, neither of which
+is a property of any method: place documents sort above streets by design
+(`SuggestionType::rankTier()`), and the actual house-number document is often a better answer
+than the street it belongs to. Of the 23 entries the incumbent does not rank first, **22 are
+outranked by a place**. The golden set predates places and is due a re-curation; until then
+the column is only useful for comparing the methods *against each other*, which is what it is
+for.
 
 And against the incumbent as baseline, over the 105 comparable queries in `queries.txt`:
 
-| method | mean Jaccard@10 | identical top-1 |
-|---|---|---|
-| `es-bool-prefix` | 0.956 | 101 of 105 |
-| `es-sayt` | 0.929 | 100 of 105 |
-| `es-prefixes` | 0.846 | 94 of 105 |
-| `es-completion` | 0.280 | 42 of 105 |
+| method | Jaccard@10 (street) | identical top-1 | | Jaccard@10 (address) | identical top-1 |
+|---|---|---|---|---|---|
+| `es-bool-prefix` | 0.956 | 101 of 105 | | 0.937 | 97 of 105 |
+| `es-sayt` | 0.929 | 100 of 105 | | 0.837 | 85 of 105 |
+| `es-prefixes` | 0.846 | 94 of 105 | | 0.806 | 86 of 105 |
+| `es-completion` | 0.280 | 42 of 105 | | 0.136 | 30 of 105 |
+
+The methods agree slightly *less* at address level: more documents means more near-ties, and
+near-ties are where the retrieval method's fingerprint shows.
 
 The four search methods agree with each other far more than they differ, and where they
 differ it is almost entirely on **one- and two-character prefixes** (`go`, `k`, `kerk`),
@@ -614,20 +713,33 @@ lower precision. Which is better is a product question the numbers are meant to 
 
 ### What this says
 
-- The hand-built edge-n-gram chain is **not** earning its complexity on this corpus. The
-  honest query-time baseline matches it on latency, beats it slightly on the golden set, and
-  costs nothing to index.
-- If the n-grams go, `es-prefixes` is the better swap than `es-sayt`: a third of the index for
-  the same behaviour, and it retires the `MAX_GRAM` cliff.
-- `es-completion` is a genuine sub-millisecond floor and a genuinely different product: right
-  for a "jump to a city" box, wrong for address lookup.
-- **Before acting on any of this, re-run it at `--level=address`.** Everything above is one
-  corpus, one shard, one node, no concurrency.
+- **`es-prefixes` is the method to ship.** It matches the incumbent everywhere, beats it
+  slightly on both the golden set and latency at address level, costs the same index, and
+  retires the `MAX_GRAM = 20` cliff and the `preserve_original` workaround that exists to
+  paper over it. It is the incumbent with less to go wrong.
+- **The hand-built edge-n-gram chain is not earning its complexity.** Nothing it does is
+  unavailable natively, and two native options match it.
+- **A prefix index does earn its keep, but only on the first two keystrokes.** That is the one
+  place `es-bool-prefix` loses, and the one place it loses badly and worse with scale (3.2× at
+  four million documents). Whether that matters is a product question: 6.6 ms is still fast,
+  and it buys back 376 MB and nineteen minutes of import.
+- `es-sayt` costs 3.4× the index of `es-prefixes` for the same behaviour. Convenience, not
+  capability.
+- `es-completion` is a genuine sub-millisecond floor (0.69 ms p50 on four million documents)
+  and a genuinely different product: right for a "jump to a city or venue" box, wrong for
+  address lookup, where it misses every street-plus-city query by construction.
+- **Query latency barely notices the corpus; indexing does.** 49× the documents cost 15% at
+  the p50 and 29× the import time. If anything here is going to hurt in production, it is the
+  write path, not the read path.
 
-Reproduce with:
+Everything above is one shard, one node, a warm cache and no concurrency. Reproduce with:
 
 ```bash
+# street level, the default import
 make benchmark ARGS="--engine=es --iterations=20"
+
+# address level: import with --level=all, then set the flag (see below)
+HOUSE_NUMBERS_INDEXED=1 make benchmark ARGS="--engine=es --iterations=20"
 ```
 
 ## Layout
@@ -725,9 +837,10 @@ to operate, it would do. It just loses on the axis that matters most for this fe
 **"Elasticsearch" now means one of five methods.** The recommendation above was measured
 with the incumbent edge-n-gram method and still stands, but the follow-up question — which
 Elasticsearch method — has its own answer, and it is not the obvious one: the method with no
-prefix index at all matches the incumbent on latency and slightly beats it on the golden set
-at this corpus size. See [The five Elasticsearch methods](#the-five-elasticsearch-methods),
-and read the scale caveat there before acting on it.
+prefix index at all matches the incumbent on latency at both corpus sizes, and the native
+`index_prefixes` beats the hand-built n-gram chain on every axis measured. See
+[The five Elasticsearch methods](#the-five-elasticsearch-methods), measured at 82,643 and at
+4,029,990 documents.
 
 Neither result speaks to the two modelling questions still open — how UiTdatabank places should rank
 against addresses, and whether house-number labels get indexed. Both land the same way on

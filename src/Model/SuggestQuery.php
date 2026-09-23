@@ -31,10 +31,31 @@ final class SuggestQuery
         public readonly int $limit = 10,
         public readonly array $types = [],
         public readonly bool $fuzzy = true,
+        /**
+         * Whether the index holds house-number documents (Config::$houseNumbersIndexed).
+         *
+         * The locative/detail split below exists for exactly one reason: on a
+         * street-level index no document carries a house number, so requiring
+         * "12" returns nothing for a completely ordinary way of writing an
+         * address. That premise is false once the index is built with
+         * --level=address or --level=all, and then the split costs precision
+         * rather than buying recall - the number is the most selective token
+         * the user typed, and demoting it to a ranking signal buries the one
+         * document they asked for under every other number in the street.
+         *
+         * Measured on the 4.0M-document index: "kerkstraat 12 gent" gates down
+         * to 413 candidates with the split and 2 without, and the two are the
+         * right ones.
+         *
+         * So the split is not dead code to delete, it is behaviour that belongs
+         * to one shape of index. The flag names the corpus, not the mechanism,
+         * because that is the thing an operator actually knows.
+         */
+        public readonly bool $houseNumbersIndexed = false,
     ) {
         $this->tokens = Normalizer::tokenize($raw);
 
-        $detailIndices = self::detailIndices($this->tokens);
+        $detailIndices = self::detailIndices($this->tokens, $houseNumbersIndexed);
         $locative = [];
         $detail = [];
 
@@ -76,17 +97,37 @@ final class SuggestQuery
      *
      * @return list<int> positions in $tokens that are address detail
      */
-    private static function detailIndices(array $tokens): array
+    private static function detailIndices(array $tokens, bool $houseNumbersIndexed = false): array
     {
         $indices = [];
 
         foreach ($tokens as $index => $token) {
-            $isDetail = Normalizer::isHouseNumberToken($token)
+            // The house number is only detail while no document carries one.
+            // Once the index is built at address level it is the most
+            // selective token in the query and belongs in the gate - but the
+            // box reference never does, whatever the index holds, because
+            // SuggestionDocument does not put box_number into search_text at
+            // all. Gating on it matches nothing by construction, which is
+            // exactly what "kerkstraat 12 bus 5 gent" did before this
+            // distinction existed: zero results on a perfectly ordinary
+            // address.
+            $isDetail = ($houseNumbersIndexed ? false : Normalizer::isHouseNumberToken($token))
                 || Normalizer::isBoxMarkerToken($token)
                 // See Normalizer::isBoxMarkerToken(): the bare "b" is only a box
                 // marker when it directly follows the house number, as in
                 // "12 b 5". Anywhere else it is someone typing a name.
-                || ($token === 'b' && in_array($index - 1, $indices, true));
+                || ($token === 'b' && $index > 0 && (
+                    in_array($index - 1, $indices, true)
+                    || Normalizer::isHouseNumberToken($tokens[$index - 1])
+                ));
+
+            // The value after a box marker is detail for the same reason as
+            // the marker: "bus 5" puts neither token anywhere a document can
+            // be matched on.
+            if (!$isDetail && $index > 0 && in_array($index - 1, $indices, true)) {
+                $previous = $tokens[$index - 1];
+                $isDetail = Normalizer::isBoxMarkerToken($previous) || $previous === 'b';
+            }
 
             if ($isDetail) {
                 $indices[] = $index;

@@ -20,6 +20,7 @@ final class Config
     public readonly string $mysqlTable;
     public readonly string $elasticsearchHost;
     public readonly string $elasticsearchIndex;
+    public readonly bool $houseNumbersIndexed;
 
     public function __construct()
     {
@@ -36,6 +37,22 @@ final class Config
         $this->mysqlTable = self::env('MYSQL_TABLE', 'location_suggestions');
         $this->elasticsearchHost = self::env('ELASTICSEARCH_HOST', 'http://127.0.0.1:9200');
         $this->elasticsearchIndex = self::env('ELASTICSEARCH_INDEX', 'location_suggestions');
+        // Whether the index holds house-number documents, i.e. whether it was
+        // built with --level=address or --level=all.
+        //
+        // This is a statement about the *corpus*, not a preference, and it is
+        // the premise the whole locative/detail split in SuggestQuery rests on.
+        // With a street-level index no document carries a house number, so
+        // requiring "12" finds nothing and the number must be demoted to a
+        // ranking signal. With an address-level index the number is the most
+        // selective thing the user typed: on "kerkstraat 12 gent" it is the
+        // difference between 413 candidates and 2.
+        //
+        // Default false because --level=street is the default import. Flip it
+        // in the environment when the index carries house numbers; getting it
+        // wrong is not fatal either way, it just costs precision (false on an
+        // address index) or recall (true on a street index).
+        $this->houseNumbersIndexed = self::flag('HOUSE_NUMBERS_INDEXED', false);
     }
 
     public function mysqlDsn(): string
@@ -46,6 +63,17 @@ final class Config
             $this->mysqlPort,
             $this->mysqlDatabase,
         );
+    }
+
+    private static function flag(string $key, bool $default): bool
+    {
+        $value = self::envOrNull($key);
+
+        if ($value === null) {
+            return $default;
+        }
+
+        return in_array(strtolower($value), ['1', 'true', 'yes', 'on'], true);
     }
 
     private static function env(string $key, string $default): string
