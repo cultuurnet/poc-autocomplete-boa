@@ -17,19 +17,25 @@ use App\Support\Normalizer;
 final class SuggestionDocument
 {
     /**
-     * @param list<string> $aliases alternative names (FR/DE, sub-localities)
+     * @param string|null  $placeName the venue name, on Place documents only.
+     *                                Kept apart from $streetName because a place
+     *                                has both: "Yper Museum" at "Grote Markt 34".
+     * @param list<string> $aliases   alternative names (FR/DE, sub-localities)
      */
     public function __construct(
         public readonly string $id,
         public readonly SuggestionType $type,
         public readonly string $label,
+        public readonly ?string $placeName,
         public readonly ?string $streetName,
         public readonly ?string $houseNumber,
         public readonly ?string $boxNumber,
         public readonly ?string $postcode,
         public readonly ?string $postName,
         public readonly string $municipalityName,
-        public readonly string $nisCode,
+        // Nullable since the place export carries no NIS code: a UiTdatabank
+        // place names its municipality but never identifies it.
+        public readonly ?string $nisCode,
         public readonly ?float $lat,
         public readonly ?float $lon,
         public readonly int $popularity,
@@ -45,6 +51,7 @@ final class SuggestionDocument
     public function searchText(): string
     {
         return Normalizer::haystack([
+            $this->placeName,
             $this->streetName,
             $this->houseNumber,
             $this->postcode,
@@ -60,7 +67,9 @@ final class SuggestionDocument
      */
     public function primaryName(): string
     {
-        return $this->streetName ?? ($this->type === SuggestionType::Postcode
+        // Place first: a place document also carries a street name, but what
+        // someone types to find it is the venue, not the street it stands on.
+        return $this->placeName ?? $this->streetName ?? ($this->type === SuggestionType::Postcode
             ? (string) $this->postcode
             : $this->municipalityName);
     }

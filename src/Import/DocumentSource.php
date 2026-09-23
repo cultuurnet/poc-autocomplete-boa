@@ -19,7 +19,7 @@ use RuntimeException;
  * pass, only when house-number level is requested, streams the individual
  * addresses and reuses the counts from pass one for ranking.
  */
-final class DocumentSource
+final class DocumentSource implements DocumentSourceInterface
 {
     private const PROGRESS_EVERY = 250_000;
 
@@ -198,7 +198,8 @@ final class DocumentSource
             yield new SuggestionDocument(
                 id: 'street:' . $key,
                 type: SuggestionType::Street,
-                label: $this->placeLabel($name, $postcode, $postName, $municipality),
+                label: NameFormatter::addressLine($name, $postcode, $postName, $municipality),
+                placeName: null,
                 streetName: $name,
                 houseNumber: null,
                 boxNumber: null,
@@ -238,6 +239,7 @@ final class DocumentSource
                 id: 'municipality:' . $nis,
                 type: SuggestionType::Municipality,
                 label: $name,
+                placeName: null,
                 streetName: null,
                 houseNumber: null,
                 boxNumber: null,
@@ -272,6 +274,7 @@ final class DocumentSource
                 id: 'postcode:' . $postcode,
                 type: SuggestionType::Postcode,
                 label: $label,
+                placeName: null,
                 streetName: null,
                 houseNumber: null,
                 boxNumber: null,
@@ -335,7 +338,8 @@ final class DocumentSource
             yield new SuggestionDocument(
                 id: 'address:' . trim($row[CsvColumns::ADDRESS_ID]),
                 type: SuggestionType::Address,
-                label: $this->placeLabel($street, $postcode, $postName, $municipality),
+                label: NameFormatter::addressLine($street, $postcode, $postName, $municipality),
+                placeName: null,
                 streetName: $name,
                 houseNumber: $houseNumber === '' ? null : $houseNumber,
                 boxNumber: $boxNumber === '' ? null : $boxNumber,
@@ -361,22 +365,6 @@ final class DocumentSource
         }
 
         fclose($handle);
-    }
-
-    /**
-     * "Goorbaan, 2230 Herselt" or "Wolterslaan, 9040 Sint-Amandsberg (Gent)"
-     * when the postal locality differs from the municipality.
-     */
-    private function placeLabel(string $street, string $postcode, string $postName, string $municipality): string
-    {
-        $locality = $postName === '' ? $municipality : $postName;
-        $label = sprintf('%s, %s %s', $street, $postcode, $locality);
-
-        if ($municipality !== '' && mb_strtolower($locality) !== mb_strtolower($municipality)) {
-            $label .= sprintf(' (%s)', $municipality);
-        }
-
-        return $label;
     }
 
     /**

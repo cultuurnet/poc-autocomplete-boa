@@ -16,6 +16,8 @@ final class Suggestion
         public readonly string $id,
         public readonly SuggestionType $type,
         public readonly string $label,
+        /** The venue name, on Place suggestions only. */
+        public readonly ?string $placeName = null,
         public readonly ?string $streetName = null,
         public readonly ?string $houseNumber = null,
         public readonly ?string $postcode = null,
@@ -41,6 +43,7 @@ final class Suggestion
             'type' => $this->type->value,
             'filter' => $this->type->filter(),
             'label' => $this->label,
+            'place_name' => $this->placeName,
             'street_name' => $this->streetName,
             'house_number' => $this->houseNumber,
             'postcode' => $this->postcode,

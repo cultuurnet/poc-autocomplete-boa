@@ -73,6 +73,44 @@ final class NameFormatter
     }
 
     /**
+     * The address half of a label: "Goorbaan, 2230 Herselt", or
+     * "Wolterslaan, 9040 Sint-Amandsberg (Gent)" when the postal locality
+     * differs from the municipality.
+     *
+     * Shared by the address register and the place export so that the address
+     * shown inside a place label reads exactly like a standalone address
+     * suggestion; two spellings of the same address in one dropdown look like
+     * two different places.
+     */
+    public static function addressLine(
+        string $street,
+        string $postcode,
+        string $postName,
+        string $municipality,
+    ): string {
+        $locality = $postName === '' ? $municipality : $postName;
+        $label = trim(sprintf('%s, %s %s', $street, $postcode, $locality));
+
+        if ($municipality !== '' && mb_strtolower($locality, 'UTF-8') !== mb_strtolower($municipality, 'UTF-8')) {
+            $label .= sprintf(' (%s)', $municipality);
+        }
+
+        return $label;
+    }
+
+    /**
+     * Collapse every whitespace run into a single space.
+     *
+     * The place export is hand-entered and regularly carries newlines and runs
+     * of dozens of spaces inside a name or a street line. Left alone they reach
+     * the dropdown verbatim and blow past the column widths for nothing.
+     */
+    public static function collapseWhitespace(string $value): string
+    {
+        return trim(preg_replace('/\s+/u', ' ', $value) ?? $value);
+    }
+
+    /**
      * Pick the single locality name to show next to a postcode.
      *
      * A postcode that covers several sub-localities has no meaningful single
