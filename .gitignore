@@ -3,6 +3,9 @@
 # 620 MB source extract, downloaded separately.
 /openaddress-bevlg.csv
 
+# 21 MB UiTdatabank place export, exported separately.
+/export_places_udb.csv
+
 # Local data dumps / anything the docker volumes spill into the tree.
 /data/*
 /docker/volumes/
