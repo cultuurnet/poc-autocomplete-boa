@@ -40,6 +40,18 @@ final class ElasticsearchIndexer implements IndexerInterface
     private const MAX_REPORTED_FAILURES = 5;
 
     /**
+     * Ceiling for the completion suggester's weight.
+     *
+     * Elasticsearch accepts any positive 32-bit integer, but the weight is
+     * stored per input in the FST, so the cap is really about keeping the value
+     * small and bounded: a million is far above any popularity this corpus
+     * produces, and staying five orders of magnitude clear of PHP_INT_MAX means
+     * a future popularity formula that multiplies instead of counts cannot turn
+     * this into a bulk rejection halfway through a 4.2M row import.
+     */
+    private const MAX_COMPLETION_WEIGHT = 1_000_000;
+
+    /**
      * Bulk payload under construction: alternating action and source lines.
      *
      * @var list<array<string, mixed>>
@@ -187,6 +199,15 @@ final class ElasticsearchIndexer implements IndexerInterface
     }
 
     /**
+     * The _source document, which under `dynamic: strict` must contain nothing
+     * that ElasticsearchMapping does not map - every key here has a counterpart
+     * there, and adding one without the other fails the bulk item rather than
+     * silently creating a field.
+     *
+     * The `.prefixes` subfields deliberately do not appear: they are
+     * multi-fields, so Lucene derives them from `primary_name` / `search_text`
+     * at index time and nothing extra is written here for them.
+     *
      * @return array<string, mixed>
      */
     private function source(SuggestionDocument $document): array
@@ -208,6 +229,18 @@ final class ElasticsearchIndexer implements IndexerInterface
             // text; the analyser then only has to n-gram it.
             'search_text' => $document->searchText(),
             'primary_name' => $document->primaryName(),
+            // The same two strings again, for the search_as_you_type method.
+            // Duplicated in _source rather than aliased because
+            // search_as_you_type cannot be a multi-field of primary_name /
+            // search_text (see ElasticsearchMapping); this is the write-side
+            // half of that constraint, and part of what the index-size
+            // comparison in the README is measuring.
+            'primary_name_sayt' => $document->primaryName(),
+            'search_text_sayt' => $document->searchText(),
+            'suggest' => [
+                'input' => $document->completionInputs(),
+                'weight' => self::completionWeight($document->popularity),
+            ],
         ];
 
         // geo_point rejects a null, and a half-null pair is meaningless anyway, so
@@ -217,6 +250,29 @@ final class ElasticsearchIndexer implements IndexerInterface
         }
 
         return $source;
+    }
+
+    /**
+     * Popularity, squeezed into the range the completion suggester accepts.
+     *
+     * Worth being blunt about what this value is: for the completion method it
+     * is the *entire* ranking signal. The FST is walked prefix-first and the
+     * matches come back ordered by weight alone - there is no BM25, no field
+     * boost, no tie-break on how much of the input the prefix covered. Two
+     * documents that both start with "gent" are ordered purely by this integer,
+     * and an exact full-name match loses to a longer name with a higher
+     * popularity. So the completion method is not being measured on relevance
+     * modelling; it is being measured on latency and on how good a proxy raw
+     * popularity is for "what the user meant". Where it ranks badly in the
+     * comparison, that is the honest result for this method, not a bug here.
+     *
+     * The floor is 1 rather than 0 because a 0-weight document still matches
+     * but always sorts last, which in a 5-row dropdown is indistinguishable
+     * from being missing.
+     */
+    private static function completionWeight(int $popularity): int
+    {
+        return max(1, min($popularity, self::MAX_COMPLETION_WEIGHT));
     }
 
     /**
