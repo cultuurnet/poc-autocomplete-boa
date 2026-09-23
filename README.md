@@ -416,6 +416,24 @@ Read the **percentile spread**, not the mean. A representative run at 82,643 doc
 The medians are a coin flip; the tail is not. For a type-ahead field, the tail is what the
 user feels.
 
+**At 4,029,990 documents it stops being a coin flip.** The same query set, both engines
+holding the same corpus (the full house-number file plus the UiTdatabank places):
+
+| engine | p50 | p90 | p95 | p99 | max |
+|---|---|---|---|---|---|
+| mysql | **1,071.70** | 1,928.34 | 2,125.40 | 2,758.65 | 3,783.60 |
+| elasticsearch | **7.98** | 19.50 | 25.56 | 40.17 | 81.23 |
+
+134× at the median, 83× at p95. A second per keystroke is not a slow autocomplete, it is not
+an autocomplete. Quality stays comparable — MySQL scores 0.540 MRR against Elasticsearch's
+0.519 on the golden set, and actually finds more of it at k=10 — so this is purely the
+retrieval cost of a `FULLTEXT` scan over four million rows against an inverted index.
+
+(The Elasticsearch column here is higher than the per-method numbers below because the two
+engines are interleaved in one run: MySQL saturating the machine for a second at a time is
+part of what Elasticsearch is being timed against. The clean Elasticsearch figure on the same
+index is 2.91 ms at p50.)
+
 Quality, measured two ways:
 
 1. **Agreement** — overlap@k, Jaccard and Spearman rank correlation between the two engines,
@@ -830,9 +848,16 @@ Three things decided it:
 
 Worth keeping in mind: the two engines agree on only **4.2 of 10** results on average, so this
 is a genuine behavioural difference and not two spellings of the same ranking. MySQL is not
-disqualified — at street level it is fast and returns a sensible list for well-spelled input,
-and it needs no extra infrastructure. If the endpoint ever had to ship without a new service
-to operate, it would do. It just loses on the axis that matters most for this feature.
+disqualified *at street level* — there it is fast, returns a sensible list for well-spelled
+input, and needs no extra infrastructure. If the endpoint ever had to ship without a new
+service to operate, it would do.
+
+**At house-number level it is disqualified outright.** Measured on the full 4,029,990-document
+corpus, MySQL's median query is **1,071.70 ms** against Elasticsearch's 7.98 ms in the same
+run — 134× — with the tail at two seconds. Its result *quality* holds up fine (0.540 MRR
+against 0.519), so this is not a ranking problem that could be tuned away; it is what a
+`FULLTEXT` scan over four million rows costs. Since house-number level is where this feature
+is actually going, that settles the question the street-level numbers left open.
 
 **"Elasticsearch" now means one of five methods.** The recommendation above was measured
 with the incumbent edge-n-gram method and still stands, but the follow-up question — which
