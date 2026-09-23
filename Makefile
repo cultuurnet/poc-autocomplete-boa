@@ -4,13 +4,18 @@ DC := docker compose
 #   make import ARGS="--limit=100000"
 ARGS ?=
 
-# Path to the address CSV, forwarded as --csv. Required by the import targets --
-# there is no default filename. Paths resolve inside the container, where the
-# project root is mounted at /app:
+# Path to the CSV, forwarded as --csv. Required by the import targets -- there is
+# no default filename. Paths resolve inside the container, where the project root
+# is mounted at /app:
 #   make import CSV=openaddress-bevlg.csv
+#   make import-places CSV=export_places_udb.csv
 #   make import CSV=data/brussels.csv
 CSV ?=
 CSV_ARG := $(if $(CSV),--csv=$(CSV),)
+
+# The place export, for `make reset`. Optional: without it reset loads only the
+# address register, which is what it always did.
+PLACES ?=
 
 # Fail with advice rather than letting bin/console report a missing path, since
 # by then you have already waited for docker compose exec to start php.
@@ -25,7 +30,8 @@ require-csv:
 .DEFAULT_GOAL := help
 
 .PHONY: help build up down destroy install require-csv import import-mysql \
-        import-es import-addresses benchmark health logs shell mysql-cli reset
+        import-es import-addresses import-places benchmark health logs shell \
+        mysql-cli reset
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "\033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -60,6 +66,9 @@ import-es: require-csv ## Import into Elasticsearch only (needs CSV=path)
 import-addresses: require-csv ## Import down to house-number level, 4.2M docs (needs CSV=path)
 	$(DC) exec php php bin/console import --engine=all --level=all --recreate $(CSV_ARG) $(ARGS)
 
+import-places: require-csv ## Import the UiTdatabank place export, ~63k docs (needs CSV=path)
+	$(DC) exec php php bin/console import-places --engine=all --recreate $(CSV_ARG) $(ARGS)
+
 benchmark: ## Run the MySQL vs Elasticsearch benchmark (ARGS passthrough)
 	$(DC) exec php php bin/console benchmark $(ARGS)
 
@@ -75,8 +84,9 @@ shell: ## Open a bash shell in the php container
 mysql-cli: ## Open a mysql client on the autocomplete database
 	$(DC) exec mysql mysql -uautocomplete -pautocomplete autocomplete
 
-reset: require-csv ## Clean rebuild: destroy volumes, start fresh, install and import (needs CSV=path)
+reset: require-csv ## Clean rebuild: destroy volumes, start fresh, install and import (needs CSV=path; PLACES=path to also load places)
 	$(MAKE) destroy
 	$(MAKE) up
 	$(MAKE) install
 	$(MAKE) import CSV="$(CSV)" ARGS="$(ARGS)"
+	@test -z "$(PLACES)" || $(MAKE) import-places CSV="$(PLACES)"

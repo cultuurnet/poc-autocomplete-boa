@@ -2,14 +2,14 @@
 
 A proof of concept for the "locatie suggesties" autocomplete endpoint described in
 *Zoek op route & locatie* (briefing 17/09, in the repo root). It indexes the Flemish address
-register and answers type-ahead queries on street, postcode and municipality — the same data,
-the same request, through **two independent engines** so their speed and their result quality
-can be compared side by side.
+register plus the UiTdatabank place export, and answers type-ahead queries on place, street,
+postcode and municipality — the same data, the same request, through **two independent
+engines** so their speed and their result quality can be compared side by side.
 
 The POC exists to answer one question: **which engine do we build the endpoint on?** It is
-not a prototype of the endpoint itself. There is no UDB3 place data, no geocoding waterfall,
-no Search API integration — only the two stores, loaded identically, and the instrumentation
-needed to tell them apart.
+not a prototype of the endpoint itself. There is no geocoding waterfall and no Search API
+integration — only the two stores, loaded identically, and the instrumentation needed to tell
+them apart.
 
 Plain PHP 8.3, no framework. Composer for autoloading and two client libraries. Everything
 runs in Docker.
@@ -33,9 +33,10 @@ No PHP or Composer on the host: everything runs inside the `php` container.
 ## Setup from zero
 
 ```
-make up                                  # build the php image, start mysql + es + nginx, wait for healthy, composer install
-make import CSV=openaddress-bevlg.csv    # street + municipality + postcode documents into both engines
-make health                              # confirm both engines hold the same document count
+make up                                        # build the php image, start mysql + es + nginx, wait for healthy, composer install
+make import CSV=openaddress-bevlg.csv          # street + municipality + postcode documents into both engines
+make import-places CSV=export_places_udb.csv   # the UiTdatabank places, into the same two stores
+make health                                    # confirm both engines hold the same document count
 open http://localhost:8080
 ```
 
@@ -43,6 +44,7 @@ open http://localhost:8080
 |---|---|---|
 | `make up` | Builds the PHP image, pulls MySQL 8.4 and Elasticsearch 8.19.12, starts all four containers, blocks until their healthchecks pass, then runs `composer install` if `vendor/` is missing | Several minutes cold (image pulls dominate); **~4 s** warm |
 | `make import CSV=...` | One pass over the 591 MiB CSV, aggregating it into 82,643 documents, written to both engines. `CSV=` is required — there is no default filename | **~38 s** |
+| `make import-places CSV=...` | One pass over the 21 MiB place export, 62,709 documents, written to both engines. Optional: the address register stands on its own | **~10 s** |
 | `make health` | Reads the configured paths and asks both engines for a document count | < 1 s |
 
 `make up` is idempotent and is the only command needed to spin the stack up — rerunning it on
@@ -59,35 +61,92 @@ A full street-level import, measured on the stack as configured:
 | peak PHP memory | 85 MiB |
 | stored size | 36 MiB MySQL table, 41 MiB Elasticsearch index |
 
+The place import on top of it:
+
+| | |
+|---|---|
+| documents produced | **62,709** (of 64,301 rows; see the rejection table below) |
+| wall clock | 10.0 s (shared CSV pass + both engines) |
+| MySQL write time | 2.5 s (25,101 docs/s) |
+| Elasticsearch write time | 6.7 s (9,352 docs/s) |
+| peak PHP memory | 24 MiB |
+
 Write time is reported per engine and excludes the CSV pass, which is shared: the file is read
 **once** and every document is fanned out to both indexers. Running the pipeline twice would
 double the slowest part of the job and — worse — could let the two engines see different input.
 
 ## What gets indexed
 
-The source file holds **4,215,562 rows**, one per individual address in Flanders, of which
-**3,884,621** are usable (status `current`, with a postcode and coordinates). That is the
-wrong granularity for autocomplete — nobody types a house number to find a street — so the
-import aggregates it:
+**Two exports, one index.** Both write into the same MySQL table and the same Elasticsearch
+index, and each import command clears only the document types it owns, so neither can destroy
+the other's documents. They are separate commands because they are separate files on separate
+release cycles, not because they produce separate stores.
 
-| Document type  | Count     | Search API filter | Example label                              |
-|----------------|-----------|-------------------|--------------------------------------------|
-| `street`       | 81,841    | `coordinates`     | `Wolterslaan, 9040 Sint-Amandsberg (Gent)` |
-| `municipality` | 285       | `region`          | `Gent`                                     |
-| `postcode`     | 517       | `region`          | `9040 Sint-Amandsberg`                     |
-| `address`      | 3,884,621 | `coordinates`     | `Goorbaan 59, 2230 Herselt`                |
+### The address register — `import`
 
-The first three are what `--level=street` (the default) produces: 82,643 documents. `address`
-documents are off by default and exist only to measure what the two engines do at ~3.9M
-documents instead of 83k.
+`openaddress-bevlg.csv` holds **4,215,562 rows**, one per individual address in Flanders, of
+which **3,884,621** are usable (status `current`, with a postcode and coordinates). That is
+the wrong granularity for autocomplete — nobody types a house number to find a street — so
+the import aggregates it.
+
+### The place export — `import-places`
+
+`export_places_udb.csv` holds **64,301 UiTdatabank places**, one row per venue, already at
+the granularity someone would pick. **62,709** are indexed; see the rejection table below.
+
+| Document type  | Count     | Search API filter | Example label                                 |
+|----------------|-----------|-------------------|-----------------------------------------------|
+| `place`        | 62,709    | `place`           | `Yper Museum (Grote Markt 34, 8900 Ieper)`    |
+| `street`       | 81,841    | `coordinates`     | `Wolterslaan, 9040 Sint-Amandsberg (Gent)`    |
+| `municipality` | 285       | `region`          | `Gent`                                        |
+| `postcode`     | 517       | `region`          | `9040 Sint-Amandsberg`                        |
+| `address`      | 3,884,621 | `coordinates`     | `Goorbaan 59, 2230 Herselt`                   |
+
+`street`, `municipality` and `postcode` are what `--level=street` (the default) produces:
+82,643 documents. `address` documents are off by default and exist only to measure what the
+two engines do at ~3.9M documents instead of 83k. The normal working set is therefore
+**145,352 documents** — the street level plus the places.
 
 Street documents carry the **average coordinate** of their addresses and an **address count**
 that doubles as a popularity signal — the register has no population data, and without some
 prior the ranking cannot tell a 3-address alley from a main road.
 
-The `coordinates` / `region` split on every suggestion is the distinction the briefing asks
-for: point suggestions feed the Search API `coordinates` filter, area suggestions feed
-`region`. Municipality and postcode documents carry the NIS code for that mapping.
+The `coordinates` / `region` / `place` split on every suggestion is the distinction the
+briefing asks for: point suggestions feed the Search API `coordinates` filter, area
+suggestions feed `region`. Municipality and postcode documents carry the NIS code for that
+mapping. A place is neither: it is already an identified entity, so its id (`place:<cdbid>`)
+is what a `location.id` filter wants, and it is the one document type that carries **no
+coordinates and no NIS code** — the export simply has none.
+
+### What a place document is made of
+
+`name` and `address` in the export are JSON keyed by language. The Dutch value wins where
+there is one (63,224 of 64,301 rows), otherwise FR, DE, EN, then whatever is there; every
+*other* language's name is indexed as an alias, so "Musée Yper" finds the Yper Museum. The
+`description` column is deliberately never indexed — it is prose about what happens at a
+place, and feeding it to the haystack would make every document match nearly every query.
+
+A locality written `Onkerzele (Geraardsbergen)` (9,557 rows) is split into its sub-locality
+and its municipality, so the place is findable by either and its label renders the address
+exactly the way a standalone address suggestion does.
+
+Places carry a **fixed popularity of 24**, which is the median number of addresses on a
+Flemish street. The export has no usage signal at all, and both engines damp popularity
+logarithmically and need a non-zero value (Elasticsearch's `log1p` factor multiplies a
+zero-popularity document's whole score by zero). 24 puts a place level with a typical street
+on that term and leaves the ordering to the tier below, where it is stated on purpose.
+
+### Rows the place import rejects
+
+| Reason | Rows | Why |
+|---|---|---|
+| not in Belgium | 1,352 | `addressCountry` is NL, DE, FR, AT, … |
+| unusable postcode | 239 | `addressCountry` says BE but the postcode is not four digits — `59000 Lille`, `5521 ND Bergeik`, `5113BV Baarle-Nassau`. These are foreign addresses mislabelled in the export. |
+| no address | 1 | no parseable address object at all |
+
+The four-digit rule is not fussiness: the `postcode` column, the `--postcode` filter and the
+postcode suggestions are all built on that shape. Every rejection is counted and printed by
+the import, because "why is my place missing" is a question that gets asked.
 
 ## CLI reference
 
@@ -120,7 +179,7 @@ Loads the register into MySQL and/or Elasticsearch from a single CSV pass.
 | `--level` | `street`, `address`, `all` | `street` | Which document types to produce — see the table below. |
 | `--limit` | integer | none | Stop after N *usable* CSV rows (rows failing the status/postcode/coordinate checks are not counted). |
 | `--postcode` | e.g. `2230`, repeatable | all | Keep only these postcodes. Still reads the whole file. |
-| `--recreate` | flag | off | Drop and rebuild the table / index before writing. Without it, documents are upserted into whatever is already there. |
+| `--recreate` | flag | off | Delete this export's own documents (`address`, `street`, `municipality`, `postcode`) before writing, leaving imported places alone. Without it, documents are upserted into whatever is already there — which refreshes what changed but never removes what disappeared from the export. |
 | `-f`, `--csv` | path | `CSV_PATH` env, otherwise **required** | Which file to import. Relative paths resolve against the working directory, which is `/app` in the container — the project root is mounted there, so any file under it works. Via make: `make import CSV=data/other.csv`. |
 
 `--level` in terms of what it costs:
@@ -189,6 +248,55 @@ docker compose exec \
   php php bin/console import --engine=all --recreate -f openaddress-bevlg.csv --limit=200000
 ```
 
+### `import-places`
+
+Loads the UiTdatabank place export. The same options as `import` minus `--level`: the address
+register is imported at a chosen granularity because it holds 4.2M house numbers nobody
+types, while this export is already one row per thing a user would pick.
+
+| Option | Values | Default | What it does |
+|---|---|---|---|
+| `--engine` | `all`, `mysql`, `elasticsearch` | `all` | As for `import`. |
+| `--limit` | integer | none | Stop after N CSV rows (counted before the rejection rules, unlike `import`). |
+| `--postcode` | e.g. `2230`, repeatable | all | Keep only these postcodes. |
+| `--recreate` | flag | off | Delete the existing `place` documents first, leaving the address register alone. |
+| `-f`, `--csv` | path | `CSV_PATH` env, otherwise **required** | Which file to import. |
+
+```bash
+# The normal case: ~63k places into both engines, ~10 s.
+make import-places CSV=export_places_udb.csv
+docker compose exec php php bin/console import-places --engine=all --recreate \
+  -f export_places_udb.csv
+
+# Both exports from scratch, in order.
+make import CSV=openaddress-bevlg.csv
+make import-places CSV=export_places_udb.csv
+
+# Or in one go.
+make reset CSV=openaddress-bevlg.csv PLACES=export_places_udb.csv
+
+# One municipality, for eyeballing.
+docker compose exec php php bin/console import-places --engine=all --recreate \
+  -f export_places_udb.csv --postcode=8900
+```
+
+The header is checked before anything is deleted, so pointing this command at the address
+register (or `import` at the place export) fails with a message naming both headers and exits
+`2` with the index untouched.
+
+**Neither import drops its store any more.** That is what keeps the two exports from
+destroying each other, but it also means a change to `sql/schema.sql` or to
+`ElasticsearchMapping` is *not* picked up by re-importing: the table and the index already
+exist, so `prepare()` leaves them as they are and the Elasticsearch bulk write then fails with
+`strict_dynamic_mapping_exception` on any field the old mapping does not know. After a schema
+or mapping change, drop the stores first — `make destroy` (wipes the volumes), or by hand:
+
+```bash
+docker compose exec mysql mysql -uautocomplete -pautocomplete autocomplete \
+  -e "DROP TABLE IF EXISTS location_suggestions"
+curl -X DELETE http://localhost:9200/location_suggestions
+```
+
 ### `benchmark`
 
 Runs the same query set against both engines and reports latency and result quality.
@@ -236,7 +344,8 @@ Exits non-zero if either engine is unhealthy. The same information is available 
 | `make logs` | Follow all service logs. |
 | `make shell` | Bash in the php container (working dir `/app`). |
 | `make mysql-cli` | `mysql` client on the `autocomplete` database. |
-| `make reset` | `destroy` + `up` + `install` + `import`. The full from-scratch rebuild. Passes `CSV=` and `ARGS=` through to the import. |
+| `make import-places` | `import-places --engine=all --recreate`. Needs `CSV=`. |
+| `make reset` | `destroy` + `up` + `install` + `import`. The full from-scratch rebuild. Passes `CSV=` and `ARGS=` through to the import; add `PLACES=export_places_udb.csv` to load the places too. |
 | `make destroy` | Stop the stack **and delete the volumes** — this wipes every imported document. |
 
 ## The comparison UI
@@ -339,14 +448,31 @@ still being typed against the n-grams, and only the tokens that name a place at 
 `should` clauses for precision, and a `function_score` applying the same log-damped
 popularity. Fuzziness is native.
 
+**Ordering across document types** is the one thing neither engine decides by score alone.
+Results are grouped into two tiers first — `municipality`, `postcode` and `place` above
+`street` and `address` — and score only decides the order *inside* a tier. The tier is one
+decision, defined once in `SuggestionType::rankTier()`; MySQL renders it as a `CASE` in the
+`ORDER BY` of every pass, Elasticsearch stores it as a `rank_tier` byte and sorts on it ahead
+of `_score`.
+
+It has to be a tier rather than a weight. A place and an address document can describe the
+same address, and on text the address wins every time — it is *named* after the street you
+typed, while the venue standing on it is not — so no boost small enough to be safe is large
+enough to overturn it. A tier states the preference directly: for `markt 62 berlaar`,
+`Baristik (Markt 62, 2590 Berlaar)` is listed above `Markt 62, 2590 Berlaar`. Municipality
+and postcode share the top tier with `place` rather than sitting above it, because their
+existing score prior already wins the case that matters — a bare `gent` answers with the city
+and not with the 56 places called Gent — while a tier above would make `markt 62 berlaar`
+lead with the town.
+
 The asymmetry in that last sentence is the point of the POC. Read the benchmark output rather
 than this paragraph.
 
 ## Layout
 
 ```
-bin/console              CLI entrypoint (import, benchmark, health)
-src/Command/             the three commands + the shared --csv option
+bin/console              CLI entrypoint (import, import-places, benchmark, health)
+src/Command/             the four commands, the shared import pipeline and --csv option
 src/Import/              CSV reading, aggregation, the two indexers
 src/Suggest/             the two suggesters behind one interface
 src/Model/               engine-agnostic query and result types
@@ -360,8 +486,9 @@ docker/                  php, nginx and mysql configuration
 
 Configuration is environment variables only, read in `src/Config.php`; `docker-compose.yml`
 injects them and `.env.example` documents them. The CSV path is the exception: it is a CLI
-option (`--csv/-f`, defined once in `src/Command/CsvPathOption.php` and shared by `import`
-and `health`), because it is the one setting that changes per run rather than per environment.
+option (`--csv/-f`, defined once in `src/Command/CsvPathOption.php` and shared by `import`,
+`import-places` and `health`), because it is the one setting that changes per run rather
+than per environment.
 It has no default — `CSV_PATH` can pin one for an environment that always reads the same
 file, and otherwise the option is required. The other defaults are the compose values, so
 `bin/console` also runs from the host against the forwarded ports if you copy `.env.example`
@@ -432,7 +559,7 @@ disqualified — at street level it is fast and returns a sensible list for well
 and it needs no extra infrastructure. If the endpoint ever had to ship without a new service
 to operate, it would do. It just loses on the axis that matters most for this feature.
 
-Neither result speaks to the two modelling questions still open — how UDB3 places should rank
+Neither result speaks to the two modelling questions still open — how UiTdatabank places should rank
 against addresses, and whether house-number labels get indexed. Both land the same way on
 either engine, so neither one changes the choice above, and both are worth settling before the
 real implementation starts.
@@ -643,5 +770,13 @@ the three changes in `MysqlSuggester` or re-run it against the previous commit.
   `docker-compose.yml`. This is a throwaway local stack.
 - The dataset is Flanders only. The briefing's full scope also covers URBIS (Brussels) and
   ICAR (Wallonia) from the same combined export on data.gov.be.
-- UDB3 place names and coordinates are not part of this POC — it only answers the question of
-  which engine to build the endpoint on.
+- Place documents carry no coordinates and no NIS code, because the UiTdatabank export has
+  neither. A `place` suggestion therefore resolves to its own id rather than to a point, and
+  the geo signal described under *Geo, the unused signal* can never apply to one.
+- A place's street line is stored as the export writes it (`Lakenhalle - Grote Markt 34`) and
+  is never split into street plus house number. Splitting would be a guess that fails
+  silently; the number is still searchable and still ranked, because it reaches both engines
+  through the folded haystack.
+- The place export is hand-maintained and shows it: 5,531 names are shared by more than one
+  place (139 are called `locatie`, 61 `online`), and some street lines are whole sentences of
+  directions. Nothing is filtered on quality — only on being a Belgian address.
