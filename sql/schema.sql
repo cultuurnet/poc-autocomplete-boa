@@ -37,17 +37,32 @@ CREATE TABLE IF NOT EXISTS `{{table}}` (
     -- "straat:1" would be the same key, which is not what an id means.
     `id`                VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
 
-    `doc_type`          ENUM('address', 'street', 'municipality', 'postcode') NOT NULL,
+    `doc_type`          ENUM('address', 'street', 'municipality', 'postcode', 'place') NOT NULL,
 
     -- Display strings keep their diacritics and their original casing.
-    `label`             VARCHAR(255) NOT NULL,
-    `street_name`       VARCHAR(190) NULL,
+    --
+    -- The widths are set by the UiTdatabank place export, not by the address
+    -- register: its text is hand-entered, so a `street_name` is occasionally a
+    -- whole sentence of directions (248 characters at the worst) and a place
+    -- label reaches 331. Under a strict sql_mode a too-narrow column is an
+    -- error mid-import, and under a lax one it is a silently truncated label.
+    `label`             VARCHAR(512) NOT NULL,
+
+    -- The venue name, on `place` rows only; NULL for everything that comes out
+    -- of the address register.
+    `place_name`        VARCHAR(255) NULL,
+
+    `street_name`       VARCHAR(255) NULL,
     `house_number`      VARCHAR(16)  NULL,
     `box_number`        VARCHAR(16)  NULL,
     `postcode`          CHAR(4)      NULL,
     `post_name`         VARCHAR(128) NULL,
     `municipality_name` VARCHAR(128) NOT NULL,
-    `nis_code`          CHAR(5)      NOT NULL,
+
+    -- NULL on `place` rows: the export names a municipality but never
+    -- identifies it, and there is no reliable name-to-NIS mapping to invent one
+    -- from (9,557 of its localities are written "Onkerzele (Geraardsbergen)").
+    `nis_code`          CHAR(5)      NULL,
 
     `lat`               DECIMAL(9,6) NULL,
     `lon`               DECIMAL(9,6) NULL,
@@ -62,7 +77,7 @@ CREATE TABLE IF NOT EXISTS `{{table}}` (
     -- quarter of the size they would be under utf8mb4, and a binary collation
     -- keeps LIKE 'x%' a plain byte comparison.
     `search_text`       TEXT         CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-    `primary_name_norm` VARCHAR(190) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    `primary_name_norm` VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
 
     PRIMARY KEY (`id`),
 

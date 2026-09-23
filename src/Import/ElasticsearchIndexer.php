@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Import;
 
+use App\Model\SuggestionType;
 use App\Suggest\ElasticsearchMapping;
 use Elastic\Elasticsearch\Client;
 use Elastic\Elasticsearch\Exception\ClientResponseException;
@@ -95,6 +96,30 @@ final class ElasticsearchIndexer implements IndexerInterface
             'index' => $this->index,
             'body' => $definition,
         ]);
+    }
+
+    public function deleteType(SuggestionType $type): int
+    {
+        // See MysqlIndexer::deleteType(): buffered documents belong to the type
+        // about to be deleted.
+        $this->flush();
+
+        if (!$this->indexExists()) {
+            return 0;
+        }
+
+        $response = $this->client->deleteByQuery([
+            'index' => $this->index,
+            // The import runs with refresh_interval -1, so without this the
+            // deletes stay invisible and a follow-up count() reports the old
+            // number. conflicts=proceed because a concurrent write is not a
+            // reason to abandon a reset.
+            'refresh' => true,
+            'conflicts' => 'proceed',
+            'body' => ['query' => ['term' => ['doc_type' => $type->value]]],
+        ])->asArray();
+
+        return (int) ($response['deleted'] ?? 0);
     }
 
     public function add(SuggestionDocument $document): void
@@ -195,6 +220,7 @@ final class ElasticsearchIndexer implements IndexerInterface
             'id' => $document->id,
             'doc_type' => $document->type->value,
             'label' => $document->label,
+            'place_name' => $document->placeName,
             'street_name' => $document->streetName,
             'municipality_name' => $document->municipalityName,
             'post_name' => $document->postName,
@@ -204,6 +230,7 @@ final class ElasticsearchIndexer implements IndexerInterface
             'box_number' => $document->boxNumber,
             'nis_code' => $document->nisCode,
             'popularity' => $document->popularity,
+            'rank_tier' => $document->type->rankTier(),
             // Pre-folded in PHP so MySQL FULLTEXT and this field hold byte-identical
             // text; the analyser then only has to n-gram it.
             'search_text' => $document->searchText(),

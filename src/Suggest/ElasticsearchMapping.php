@@ -167,6 +167,15 @@ final class ElasticsearchMapping
                 'label' => self::storedText(),
                 'street_name' => self::storedText(keyword: true),
 
+                // Display only, like label: the venue name a place is actually
+                // searched by is carried by primary_name (see
+                // SuggestionDocument::primaryName()) and by search_text, so an
+                // analysed copy here would index the same text a third time.
+                // No keyword subfield either - nothing collapses or aggregates
+                // on it, and 5,531 place names in the export are shared by more
+                // than one place, so it would not be an identity anyway.
+                'place_name' => self::storedText(),
+
                 'municipality_name' => self::foldedText(),
                 'post_name' => self::foldedText(),
 
@@ -196,6 +205,15 @@ final class ElasticsearchMapping
 
                 'location' => ['type' => 'geo_point'],
                 'popularity' => ['type' => 'integer'],
+
+                // SuggestionType::rankTier(), denormalised onto the document so
+                // the suggester can sort on it. It is derivable from doc_type,
+                // but sorting needs doc_values on a numeric field: the
+                // alternative is a script or runtime field, which would be
+                // evaluated per matching document and turns a sub-millisecond
+                // sort into tens of milliseconds on a query like "straat" that
+                // matches most of the index. One byte per document buys that.
+                'rank_tier' => ['type' => 'byte'],
 
                 // The catch-all recall gate, mirroring the MySQL FULLTEXT column.
                 // It is fed the already-deduplicated haystack from

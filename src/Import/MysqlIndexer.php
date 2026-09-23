@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Import;
 
+use App\Model\SuggestionType;
 use App\Support\Normalizer;
 use InvalidArgumentException;
 use PDO;
@@ -22,8 +23,8 @@ use Throwable;
 final class MysqlIndexer implements IndexerInterface
 {
     /**
-     * 2000 rows x 15 columns = 30k placeholders. MySQL refuses a prepared
-     * statement with more than 65535 of them, so 4369 rows is the hard ceiling
+     * 2000 rows x 16 columns = 32k placeholders. MySQL refuses a prepared
+     * statement with more than 65535 of them, so 4095 rows is the hard ceiling
      * for this column list: do not raise the batch size without recounting.
      * The other ceiling is max_allowed_packet (256M in docker/mysql/my.cnf);
      * a 2000-row batch is a few hundred kilobytes, so that one is not close.
@@ -35,6 +36,7 @@ final class MysqlIndexer implements IndexerInterface
         'id',
         'doc_type',
         'label',
+        'place_name',
         'street_name',
         'house_number',
         'box_number',
@@ -91,6 +93,19 @@ final class MysqlIndexer implements IndexerInterface
         foreach ($schema['create'] as $statement) {
             $this->pdo->exec($statement);
         }
+    }
+
+    public function deleteType(SuggestionType $type): int
+    {
+        // Buffered documents are for the type being imported, so letting them
+        // sit through a delete of that same type would silently un-delete part
+        // of the previous import.
+        $this->flush();
+
+        $statement = $this->pdo->prepare(sprintf('DELETE FROM `%s` WHERE `doc_type` = ?', $this->table));
+        $statement->execute([$type->value]);
+
+        return $statement->rowCount();
     }
 
     public function add(SuggestionDocument $document): void
@@ -218,6 +233,7 @@ final class MysqlIndexer implements IndexerInterface
             $document->id,
             $document->type->value,
             $document->label,
+            $document->placeName,
             $document->streetName,
             $document->houseNumber,
             $document->boxNumber,
