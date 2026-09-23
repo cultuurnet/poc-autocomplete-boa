@@ -383,9 +383,13 @@ kbd {
 .badge.type-street { border-color: transparent; background: var(--shared-bg); color: var(--shared); }
 .badge.type-municipality,
 .badge.type-postcode { border-color: transparent; background: var(--ok-bg); color: var(--ok); }
+/* Places come from the UiTdatabank export rather than the address register,
+   so they get their own colour instead of sharing one with either family. */
+.badge.type-place { border-color: transparent; background: var(--unique-bg); color: var(--unique); }
 
 .badge.filter-coordinates,
-.badge.filter-region {
+.badge.filter-region,
+.badge.filter-place {
   font-family: var(--mono);
   background: transparent;
   color: var(--ink-3);
