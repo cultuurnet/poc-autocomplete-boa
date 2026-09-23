@@ -273,7 +273,7 @@ final class ElasticsearchSuggester implements SuggesterInterface
                             'filter' => [
                                 ['terms' => ['doc_type' => $query->typeValues()]],
                             ],
-                            'must' => $this->gateClauses($query, $text, $fuzzyFallback),
+                            'must' => $this->gateClauses($query, $fuzzyFallback),
                             'should' => $this->precisionClauses($query, $text, $fuzzyFallback),
                             // Explicit: `should` is pure ranking here. With a `must`
                             // present ES defaults to this anyway, but leaving it
@@ -321,13 +321,23 @@ final class ElasticsearchSuggester implements SuggesterInterface
      *
      * @return list<array<string, mixed>>
      */
-    private function gateClauses(SuggestQuery $query, string $text, bool $fuzzyFallback): array
+    private function gateClauses(SuggestQuery $query, bool $fuzzyFallback): array
     {
         // The fallback pass makes fuzziness itself the gate, and edit distance
-        // over whole words is the whole point of it, so the split does not apply:
-        // it runs the complete text through one fuzzy clause as before.
+        // over whole words is the whole point of it, so the prefix/whole-word
+        // split does not apply here: one fuzzy clause over the lot.
+        //
+        // The locative/detail split does still apply, and for the same reason it
+        // applies below. `operator => and` means every term in the text is
+        // required, so feeding the complete query back in re-imposed the house
+        // number this method spends the rest of its body keeping out - and it
+        // did so in the one pass that only ever runs because the strict gate
+        // already came back empty. "kerkstraat 12 9000 gent" found nothing while
+        // "kerkstraat 9000 gent" found three.
         if ($fuzzyFallback) {
-            return [['match' => ['search_text' => $this->fuzzyOptions($text, 'and', 1.0)]]];
+            $locative = implode(' ', $query->locativeTokens());
+
+            return [['match' => ['search_text' => $this->fuzzyOptions($locative, 'and', 1.0)]]];
         }
 
         $clauses = [];
