@@ -44,8 +44,9 @@ final class MysqlSuggester implements SuggesterInterface
     private const FULLTEXT_INDEX = 'ft_search_text';
 
     /** Columns every pass returns, in addition to the scoring components. */
-    private const BASE_COLUMNS = '`id`, `doc_type`, `label`, `street_name`, `house_number`, `postcode`, '
-        . '`post_name`, `municipality_name`, `nis_code`, `lat`, `lon`, `popularity`, `primary_name_norm`';
+    private const BASE_COLUMNS = '`id`, `doc_type`, `label`, `place_name`, `street_name`, `house_number`, '
+        . '`postcode`, `post_name`, `municipality_name`, `nis_code`, `lat`, `lon`, `popularity`, '
+        . '`primary_name_norm`';
 
     /**
      * Shorter terms are not sent to the fulltext index. innodb_ft_min_token_size
@@ -80,8 +81,11 @@ final class MysqlSuggester implements SuggesterInterface
     private const W_POPULARITY = 2.0;
 
     /**
-     * Candidates fetched per pass. Every pass orders by the same final score,
-     * so merging the top N of each still yields the true global top `limit`.
+     * Candidates fetched per pass. Every pass orders by the same tier-then-score
+     * key the final ranking uses, so merging the top N of each still yields the
+     * true global top `limit`. Ordering the passes on score alone would break
+     * that: a tier-0 document sitting at rank 400 on score belongs in the
+     * answer, and would never reach the pool to be lifted.
      */
     private const POOL_FACTOR = 10;
     private const POOL_MIN = 50;
@@ -323,7 +327,11 @@ final class MysqlSuggester implements SuggesterInterface
         array $whereParams,
         int $limit,
     ): array {
-        $select = [self::BASE_COLUMNS, sprintf('%s AS ft_score', $scoreExpr)];
+        $select = [
+            self::BASE_COLUMNS,
+            sprintf('%s AS ft_score', $scoreExpr),
+            sprintf('%s AS rank_tier', self::rankTierExpr()),
+        ];
         $params = $scoreParams;
         $sum = sprintf('LEAST(c.ft_score, %.2F) * %.2F', self::FT_SCORE_CAP, self::FT_WEIGHT);
 
@@ -342,7 +350,7 @@ final class MysqlSuggester implements SuggesterInterface
         // interpolating it avoids the PDO dance of binding LIMIT as PARAM_INT.
         $sql = sprintf(
             "SELECT c.*, (%s) AS score\nFROM (\n    SELECT %s\n    FROM `%s`\n    WHERE %s\n) AS c\n"
-                . "ORDER BY score DESC, c.popularity DESC, c.id ASC\nLIMIT %d",
+                . "ORDER BY c.rank_tier ASC, score DESC, c.popularity DESC, c.id ASC\nLIMIT %d",
             $sum,
             implode(",\n           ", $select),
             $this->table,
@@ -681,8 +689,24 @@ final class MysqlSuggester implements SuggesterInterface
                 $houseNumber = $token;
                 $terms[] = [
                     'alias' => 'hit_house_number',
-                    'expr' => "COALESCE(`house_number`, '') = ?",
-                    'params' => [$token],
+                    // Two readings of "does this document sit at number 62",
+                    // because not every document type carries the number in a
+                    // column. Address documents do, and are judged on it.
+                    // Places do not: the export gives one free-text street line
+                    // ("Markt 62"), so their number only exists inside the
+                    // haystack, and without the fallback a place at exactly the
+                    // typed address scored zero here while the address document
+                    // next to it scored 20. Elasticsearch has always matched its
+                    // detail tokens against search_text, so this is also what
+                    // puts the two engines back on the same footing.
+                    //
+                    // The space padding makes it a whole-token match: search_text
+                    // is Normalizer output, so tokens are single-space separated
+                    // and " 62 " cannot hit 620 or 162. Guarded on a NULL column
+                    // rather than on doc_type so address ranking is untouched.
+                    'expr' => "(COALESCE(`house_number`, '') = ? "
+                        . "OR (`house_number` IS NULL AND CONCAT(' ', `search_text`, ' ') LIKE ?))",
+                    'params' => [$token, '% ' . $token . ' %'],
                     'weight' => self::W_HOUSE_NUMBER_HIT,
                 ];
 
@@ -713,6 +737,27 @@ final class MysqlSuggester implements SuggesterInterface
     }
 
     /**
+     * SuggestionType::rankTier() as a SQL expression.
+     *
+     * A hard grouping applied before the score, unlike typeWeightExpr() below,
+     * which only nudges. Built from the enum rather than written out so the two
+     * engines cannot drift: the tier is one decision, stated in one place.
+     * Interpolation is safe because both halves come from the enum.
+     */
+    private static function rankTierExpr(): string
+    {
+        $cases = '';
+
+        foreach (SuggestionType::cases() as $type) {
+            $cases .= sprintf(" WHEN '%s' THEN %d", $type->value, $type->rankTier());
+        }
+
+        // The ELSE cannot be reached through this application, but a row written
+        // by an older version of the code should sort last rather than first.
+        return sprintf('CASE `doc_type`%s ELSE 1 END', $cases);
+    }
+
+    /**
      * Per document type, the prior for "is this the kind of thing meant here".
      *
      * A municipality outranks the three thousand streets inside it, otherwise
@@ -722,12 +767,27 @@ final class MysqlSuggester implements SuggesterInterface
      * to and would otherwise fill the list with Goorbaan 1, 2, 3, so they are
      * pushed down hard until a number shows up, and promoted above the street
      * once one does.
+     *
+     * A place is a named thing at an address, so it beats both the street it
+     * stands on and the bare address of that street - a venue is the more
+     * specific answer, and it is the one the user typed a name for. Note the
+     * two branches place it differently *relative to the municipality*: at 8 it
+     * sits below the town, so a bare "gent" still answers with the city rather
+     * than with the 56 places called Gent, but once a house number is in the
+     * query it goes to 15, above both the promoted address (14) and the town,
+     * because "kattestraat 118 kuurne" is as concrete as a query gets and the
+     * venue at that number is the best answer to it.
+     *
+     * The ELSE branch is `address`; every other type is named, so adding one
+     * without naming it here silently gives it the address prior.
      */
     private function typeWeightExpr(bool $houseNumberTyped): string
     {
         return $houseNumberTyped
-            ? "CASE `doc_type` WHEN 'municipality' THEN 12 WHEN 'postcode' THEN 10 WHEN 'street' THEN 2 ELSE 14 END"
-            : "CASE `doc_type` WHEN 'municipality' THEN 12 WHEN 'postcode' THEN 10 WHEN 'street' THEN 4 ELSE -20 END";
+            ? "CASE `doc_type` WHEN 'municipality' THEN 12 WHEN 'postcode' THEN 10 WHEN 'place' THEN 15 "
+                . "WHEN 'street' THEN 2 ELSE 14 END"
+            : "CASE `doc_type` WHEN 'municipality' THEN 12 WHEN 'postcode' THEN 10 WHEN 'place' THEN 8 "
+                . "WHEN 'street' THEN 4 ELSE -20 END";
     }
 
     /**
@@ -777,10 +837,16 @@ final class MysqlSuggester implements SuggesterInterface
     {
         $candidates = array_values($candidates);
 
+        // Tier first and score only within a tier -- see
+        // SuggestionType::rankTier(). Read straight off the row rather than
+        // recomputed here, so the order the SQL used to fill the pool and the
+        // order applied to the merged pool are the same key.
+        //
         // Popularity and id as tie-breakers so two runs of the benchmark over
         // the same data produce the same list.
         usort($candidates, static function (array $a, array $b): int {
-            return $b['score'] <=> $a['score']
+            return (int) $a['row']['rank_tier'] <=> (int) $b['row']['rank_tier']
+                ?: $b['score'] <=> $a['score']
                 ?: (int) $b['row']['popularity'] <=> (int) $a['row']['popularity']
                 ?: strcmp((string) $a['row']['id'], (string) $b['row']['id']);
         });
@@ -794,12 +860,13 @@ final class MysqlSuggester implements SuggesterInterface
                 id: (string) $row['id'],
                 type: SuggestionType::from((string) $row['doc_type']),
                 label: (string) $row['label'],
+                placeName: $row['place_name'] === null ? null : (string) $row['place_name'],
                 streetName: $row['street_name'] === null ? null : (string) $row['street_name'],
                 houseNumber: $row['house_number'] === null ? null : (string) $row['house_number'],
                 postcode: $row['postcode'] === null ? null : (string) $row['postcode'],
                 postName: $row['post_name'] === null ? null : (string) $row['post_name'],
                 municipalityName: (string) $row['municipality_name'],
-                nisCode: (string) $row['nis_code'],
+                nisCode: $row['nis_code'] === null ? null : (string) $row['nis_code'],
                 lat: $row['lat'] === null ? null : (float) $row['lat'],
                 lon: $row['lon'] === null ? null : (float) $row['lon'],
                 score: $candidate['score'],

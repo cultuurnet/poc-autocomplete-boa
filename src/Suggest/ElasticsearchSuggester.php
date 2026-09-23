@@ -56,6 +56,7 @@ final class ElasticsearchSuggester implements SuggesterInterface
         'id',
         'doc_type',
         'label',
+        'place_name',
         'street_name',
         'house_number',
         'box_number',
@@ -266,6 +267,23 @@ final class ElasticsearchSuggester implements SuggesterInterface
             'track_total_hits' => self::TRACK_TOTAL_HITS,
             '_source' => self::SOURCE_FIELDS,
             'explain' => $this->explain ? true : null,
+            // The hard grouping from SuggestionType::rankTier(), which the
+            // function_score below cannot express: scores here are unbounded
+            // (a good name match reaches four figures), so no weight is large
+            // enough to guarantee one type always outranks another. Sorting on
+            // an indexed byte does guarantee it, and keeping _score as the
+            // secondary key leaves the ranking inside a tier exactly as it was.
+            // _score being part of the sort is also what keeps it populated on
+            // every hit; only hits.max_score goes null under a field sort.
+            'sort' => [
+                // unmapped_type matters: sorting on a field an index does not
+                // have is a 400, so without it every query against an index
+                // built before rank_tier existed fails outright instead of
+                // simply falling back to score order. A mapping addition should
+                // cost a re-import, not an outage.
+                ['rank_tier' => ['order' => 'asc', 'unmapped_type' => 'byte']],
+                ['_score' => 'desc'],
+            ],
             'query' => [
                 'function_score' => [
                     'query' => [
@@ -605,6 +623,12 @@ final class ElasticsearchSuggester implements SuggesterInterface
      * town. Weights are small on purpose - they are a prior, and the gate plus
      * the name boosts still win whenever the user actually typed a street.
      *
+     * Place sits between postcode and street: someone who types a venue name
+     * means the venue, and a place is a more specific answer than the street it
+     * stands on, so it outranks both street and address documents. It stays
+     * below municipality and postcode because a bare "gent" is still a question
+     * about the city, not about the 56 places called Gent.
+     *
      * @return list<array<string, mixed>>
      */
     private function scoringFunctions(): array
@@ -620,6 +644,7 @@ final class ElasticsearchSuggester implements SuggesterInterface
             ],
             ['filter' => ['term' => ['doc_type' => SuggestionType::Municipality->value]], 'weight' => 1.6],
             ['filter' => ['term' => ['doc_type' => SuggestionType::Postcode->value]], 'weight' => 1.35],
+            ['filter' => ['term' => ['doc_type' => SuggestionType::Place->value]], 'weight' => 1.2],
             ['filter' => ['term' => ['doc_type' => SuggestionType::Street->value]], 'weight' => 1.0],
             ['filter' => ['term' => ['doc_type' => SuggestionType::Address->value]], 'weight' => 0.75],
         ];
@@ -675,6 +700,7 @@ final class ElasticsearchSuggester implements SuggesterInterface
                 // mysterious recall gap in the comparison instead of an error.
                 type: SuggestionType::from((string) ($source['doc_type'] ?? '')),
                 label: (string) ($source['label'] ?? ''),
+                placeName: $this->nullableString($source['place_name'] ?? null),
                 streetName: $this->nullableString($source['street_name'] ?? null),
                 houseNumber: $this->nullableString($source['house_number'] ?? null),
                 postcode: $this->nullableString($source['postcode'] ?? null),
