@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Address autocomplete: MySQL vs Elasticsearch</title>
+<title>Address autocomplete: method comparison</title>
 <link rel="stylesheet" href="style.css">
 <link rel="icon" href="data:,">
 </head>
@@ -11,7 +11,7 @@
 
 <header class="top">
   <div class="top-row">
-    <h1>Address autocomplete <span class="sub">MySQL 8.4 vs Elasticsearch 8.19, identical data</span></h1>
+    <h1>Address autocomplete <span class="sub">MySQL 8.4 vs Elasticsearch 8.19, identical data, one method per column</span></h1>
     <div class="health" id="health" aria-live="polite">
       <span class="health-item is-unknown">checking engines&hellip;</span>
     </div>
@@ -64,31 +64,48 @@
   <div class="trend" id="trend"></div>
 </header>
 
+<!--
+  Each column is a side, not an engine: the heading *is* the method picker,
+  and app.js fills it from the method list in /api/health. The single option
+  below each select is the first-visit default, so the page has a title before
+  the script runs and the served HTML still says what it shows; the script
+  replaces the whole option list.
+-->
 <main class="columns" id="columns">
-  <section class="column" data-engine="mysql" tabindex="-1">
+  <section class="column" data-column="left" data-method="mysql" tabindex="-1">
     <header class="column-head">
-      <h2>MySQL</h2>
+      <h2 class="column-title">
+        <select class="method-select" aria-label="Method shown in the left column">
+          <option value="mysql">MySQL</option>
+        </select>
+      </h2>
       <span class="fastest" hidden>fastest</span>
       <dl class="stats">
         <div><dt>engine</dt><dd class="stat-server">&ndash;</dd></div>
         <div><dt>round-trip</dt><dd class="stat-client">&ndash;</dd></div>
         <div><dt>results</dt><dd class="stat-count">&ndash;</dd></div>
       </dl>
+      <p class="method-note" hidden></p>
     </header>
     <p class="engine-error" hidden></p>
     <ol class="results"></ol>
     <p class="empty" hidden>No results.</p>
   </section>
 
-  <section class="column" data-engine="elasticsearch" tabindex="-1">
+  <section class="column" data-column="right" data-method="elasticsearch" tabindex="-1">
     <header class="column-head">
-      <h2>Elasticsearch</h2>
+      <h2 class="column-title">
+        <select class="method-select" aria-label="Method shown in the right column">
+          <option value="elasticsearch">ES edge n-gram</option>
+        </select>
+      </h2>
       <span class="fastest" hidden>fastest</span>
       <dl class="stats">
         <div><dt>engine</dt><dd class="stat-server">&ndash;</dd></div>
         <div><dt>round-trip</dt><dd class="stat-client">&ndash;</dd></div>
         <div><dt>results</dt><dd class="stat-count">&ndash;</dd></div>
       </dl>
+      <p class="method-note" hidden></p>
     </header>
     <p class="engine-error" hidden></p>
     <ol class="results"></ol>

@@ -28,6 +28,11 @@
 
   --radius: 6px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  /* The method pickers are real <select>s and their popup menu is drawn by
+     the OS, not by anything here. Without this the menu stays light while the
+     page is dark, which is the one part of the UI we cannot restyle. */
+  color-scheme: light dark;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -99,6 +104,7 @@ h1 .sub {
 
 .health {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.4rem;
   cursor: pointer;
 }
@@ -223,8 +229,20 @@ kbd {
 }
 
 .trend-item strong { color: var(--ink); }
-.trend-mysql strong { color: var(--mysql); }
-.trend-elasticsearch strong { color: var(--es); }
+
+/* Colour says which store answered, not which column asked: every method
+   except the MySQL baseline is backed by Elasticsearch. */
+.trend-item[data-method] strong { color: var(--es); }
+.trend-item[data-method="mysql"] strong { color: var(--mysql); }
+
+.trend-side {
+  margin-right: 0.35rem;
+  color: var(--ink-3);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
 .trend-n { color: var(--ink-3); }
 
 /* ---------------------------------------------------------------- columns */
@@ -261,14 +279,73 @@ kbd {
   border-bottom: 1px solid var(--line);
 }
 
-.column-head h2 {
+/* ----------------------------------------------------------- method picker */
+
+/* The heading is the picker. A separate title plus a dropdown saying the same
+   word would be two places to read; this way the column is labelled by the
+   control that sets the label. The select keeps its native behaviour and
+   keyboard handling -- only the chrome is ours, down to the caret, because
+   the platform default sits at a size and weight no heading would use. */
+.column-title {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
   margin: 0;
   font-size: 0.9rem;
   font-weight: 650;
+  color: var(--es);
 }
 
-.column[data-engine="mysql"] .column-head h2 { color: var(--mysql); }
-.column[data-engine="elasticsearch"] .column-head h2 { color: var(--es); }
+.column[data-method="mysql"] .column-title { color: var(--mysql); }
+
+.method-select {
+  /* A select is as wide as its widest option, which would leave the caret
+     floating an inch away from a short label like "MySQL". Where this is
+     supported the box hugs the chosen label; where it is not, the fixed width
+     is merely wider than it needs to be. */
+  field-sizing: content;
+  max-width: min(18rem, 60vw);
+  padding: 0.1rem 1.4rem 0.1rem 0.35rem;
+  color: inherit;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  font: inherit;
+  text-overflow: ellipsis;
+  appearance: none;
+  cursor: pointer;
+}
+
+.method-select:hover { background: var(--panel-2); border-color: var(--line); }
+
+.method-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* The popup itself is OS-drawn; these only matter where it is not. */
+.method-select option { color: var(--ink); background: var(--panel); }
+
+.column-title::after {
+  content: "";
+  margin-left: -1rem;
+  border: 0.27rem solid transparent;
+  border-top-color: currentColor;
+  transform: translateY(0.14rem);
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+/* One line, and only for methods that would otherwise be read as a
+   like-for-like quality result. It spans the head so the stats keep their
+   row. */
+.method-note {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--warn);
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
 
 .fastest {
   padding: 0.05rem 0.4rem;
