@@ -11,6 +11,30 @@ namespace App\Suggest;
  * there is exactly one place where "what does the ES side actually do" is stated.
  * If this drifts from src/Support/Normalizer.php the comparison stops being fair,
  * because the two engines would then be indexing different text.
+ *
+ * ## Why one index carries five autocomplete methods
+ *
+ * The index-time n-gram field below (`search_text` / `primary_name`) is only one
+ * of the ways Elasticsearch can answer a prefix query; the point of this POC is
+ * to find out which of them is actually the best fit for Belgian addresses. The
+ * only honest way to compare them is to run them over the *same* documents, in
+ * the same index, on the same hardware, on the same day - so instead of building
+ * five indices that would immediately drift apart, every method gets its own
+ * field here and shares one set of documents:
+ *
+ *   - `search_text` / `primary_name`   index-time edge n-grams (the current one)
+ *   - `*.prefixes`                     index_prefixes, ES's built-in prefix index
+ *   - `*_sayt`                         search_as_you_type (n-grams + shingles)
+ *   - `suggest`                        the completion suggester (FST in memory)
+ *   - (no field)                       plain match_phrase_prefix, query-time only
+ *
+ * That is deliberately paid for in disk: the extra fields roughly double the
+ * postings this index has to hold, and the completion field additionally wants
+ * its FST resident in heap on every node. A production deployment would keep
+ * exactly one of them. The cost is not a guess either - it is attributable per
+ * field with `POST /location_suggestions/_disk_usage?run_expensive_tasks=true`,
+ * which walks the segments and reports stored/doc-values/postings bytes for each
+ * field separately, so the README can quote what each method really costs.
  */
 final class ElasticsearchMapping
 {
@@ -41,6 +65,45 @@ final class ElasticsearchMapping
      * exact "the user typed the complete name" lookup needs.
      */
     public const KEYWORD_NORMALIZER = 'folding_keyword';
+
+    /**
+     * Lower bound of the `index_prefixes` range on the `.prefixes` subfields.
+     * 1 for the same reason as MIN_GRAM: the first keystroke must already be a
+     * term lookup, not a scan.
+     */
+    public const PREFIX_MIN_CHARS = 1;
+
+    /**
+     * Upper bound of `index_prefixes`. 19 is the hard ceiling Elasticsearch
+     * enforces (max_chars must be < 20), not a tuning choice - and it is also
+     * why this method has no equivalent of the MAX_GRAM=20 cliff: above the
+     * ceiling, index_prefixes does not stop matching, it silently falls back to
+     * an ordinary prefix query on the field's real terms. So a 21-character
+     * "Kortrijksepoortstraat" is still findable by its full spelling *without*
+     * the preserve_original workaround the edge-n-gram filter needs, it just
+     * costs a term scan for those rare long prefixes instead of a term lookup.
+     * That difference - a graceful slowdown versus a correctness patch - is one
+     * of the things the comparison is meant to surface.
+     */
+    public const PREFIX_MAX_CHARS = 19;
+
+    /**
+     * search_as_you_type builds a shingle subfield per size, so 3 means the
+     * field silently becomes four Lucene fields (root, _2gram, _3gram,
+     * _index_prefix). 3 is the ES default and covers "sint pieters nieuwstraat"
+     * style multi-word prefixes; raising it buys little here because Belgian
+     * address queries are short, and every increment is another postings list.
+     */
+    public const SAYT_MAX_SHINGLE_SIZE = 3;
+
+    /**
+     * Completion inputs are truncated to this many characters at index time.
+     * 50 comfortably clears the longest Belgian street name, and keeping it low
+     * matters more than usual: the completion index is an FST that has to be
+     * loaded into heap in full, so every extra character is resident memory on
+     * a node rather than bytes on a disk.
+     */
+    public const COMPLETION_MAX_INPUT_LENGTH = 50;
 
     /**
      * Full create-index body.
@@ -225,12 +288,18 @@ final class ElasticsearchMapping
                 // before it is a finished word (.folded). Gating a finished word
                 // against the n-grammed parent is what made "gent kort" also match
                 // Gentbrugge and Gentse.
+                //
+                // .prefixes is the alternative-method subfield and changes nothing
+                // about the two above: the root field still analyses and scores
+                // exactly as it did, so the `elasticsearch` method's queries and
+                // results are unaffected by it being here.
                 'search_text' => self::autocompleteText([
                     'folded' => [
                         'type' => 'text',
                         'analyzer' => self::SEARCH_ANALYZER,
                         'norms' => false,
                     ],
+                    'prefixes' => self::prefixIndexedText(),
                 ]),
 
                 'primary_name' => [
@@ -265,6 +334,66 @@ final class ElasticsearchMapping
                         'folded' => [
                             'type' => 'text',
                             'analyzer' => self::SEARCH_ANALYZER,
+                        ],
+                        // Method 2 of 5. Same source text as the n-grammed root
+                        // field, a completely different way of storing it.
+                        'prefixes' => self::prefixIndexedText(),
+                    ],
+                ],
+
+                // Method 3 of 5: search_as_you_type. Two top-level fields rather
+                // than subfields of primary_name/search_text, because ES refuses
+                // search_as_you_type inside `fields` - it is not a single Lucene
+                // field but a small family of them (root, _2gram, _3gram,
+                // _index_prefix) that the type generates for itself, and a
+                // multi-field is not allowed to fan out like that. Hence the
+                // `_sayt` suffix instead of `primary_name.sayt`; the indexer has
+                // to emit the same text twice, once per field.
+                //
+                // Both are given the folding analyser rather than the default
+                // `standard` so this method sees the same folded, punctuation-
+                // stripped tokens as every other method. "Rue de l'Église" has
+                // to tokenise identically everywhere or the comparison measures
+                // analysis differences instead of method differences.
+                'primary_name_sayt' => self::searchAsYouType(),
+                'search_text_sayt' => self::searchAsYouType(),
+
+                // Method 4 of 5: the completion suggester. Structurally unlike
+                // the others - it is not a query at all but an in-memory FST
+                // consulted through the _search `suggest` section, which is why
+                // it is fast and why it is inflexible.
+                'suggest' => [
+                    'type' => 'completion',
+                    // Folding again, for the same reason as above. It applies to
+                    // both the stored inputs and the typed prefix.
+                    'analyzer' => self::SEARCH_ANALYZER,
+                    // Keep the whitespace boundary significant, so "gent brug"
+                    // cannot complete out of "gentbrugge". Dropping separators
+                    // would raise recall on typo-ish input, but this POC is
+                    // comparing precision at the top of a 5-row dropdown.
+                    'preserve_separators' => true,
+                    'max_input_length' => self::COMPLETION_MAX_INPUT_LENGTH,
+                    // The suggest API cannot take a query, a filter, or a
+                    // post_filter - it only walks the FST - so the type filter
+                    // that every other method expresses as a `term` clause has
+                    // to be baked into the index as a category context. `path`
+                    // makes it read the value straight off the document's own
+                    // doc_type field, so the indexer does not have to duplicate
+                    // it into the suggest object.
+                    //
+                    // No geo context here on purpose, even though distance
+                    // ranking would suit an address autocomplete: a geo context
+                    // is indexed per input, and once a query supplies a geo
+                    // context, documents indexed without one are simply not in
+                    // the candidate set. Our corpus has documents with no
+                    // coordinates at all (municipalities and postcodes, mostly),
+                    // and quietly making those unreachable would corrupt the
+                    // recall figures this whole exercise exists to produce.
+                    'contexts' => [
+                        [
+                            'name' => 'doc_type',
+                            'type' => 'category',
+                            'path' => 'doc_type',
                         ],
                     ],
                 ],
@@ -365,5 +494,52 @@ final class ElasticsearchMapping
         }
 
         return $mapping;
+    }
+
+    /**
+     * Plain folded text with Lucene's own prefix index switched on.
+     *
+     * The n-gram approach above expands one token into up to 20 terms in the
+     * main postings list, which is what forces the search_analyzer split, the
+     * disabled norms and the preserve_original rescue. index_prefixes does the
+     * same job as a *side* index maintained by Lucene: the field's own terms
+     * stay whole (so scoring, norms and phrase queries still behave like normal
+     * text), and a `prefix` query is transparently rewritten against the hidden
+     * prefix field. That also means there is no index/search analyser asymmetry
+     * to get wrong - one analyser, both sides.
+     *
+     * @return array<string, mixed>
+     */
+    private static function prefixIndexedText(): array
+    {
+        return [
+            'type' => 'text',
+            'analyzer' => self::SEARCH_ANALYZER,
+            'index_prefixes' => [
+                'min_chars' => self::PREFIX_MIN_CHARS,
+                'max_chars' => self::PREFIX_MAX_CHARS,
+            ],
+        ];
+    }
+
+    /**
+     * A search_as_you_type field: edge n-grams plus word shingles.
+     *
+     * The interesting difference from every other method here is that this one
+     * indexes *word order*. The shingle subfields turn "sint pieters" into a
+     * single term, so a multi-word prefix is a term lookup rather than a phrase
+     * query over positions - which is exactly the case our long Flemish street
+     * names hit constantly, and exactly where match_phrase_prefix gets slow.
+     * The price is the four Lucene fields it silently creates per declaration.
+     *
+     * @return array<string, mixed>
+     */
+    private static function searchAsYouType(): array
+    {
+        return [
+            'type' => 'search_as_you_type',
+            'analyzer' => self::SEARCH_ANALYZER,
+            'max_shingle_size' => self::SAYT_MAX_SHINGLE_SIZE,
+        ];
     }
 }

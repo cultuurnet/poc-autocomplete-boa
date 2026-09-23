@@ -18,7 +18,8 @@ use Symfony\Component\Console\Style\SymfonyStyle;
 use Throwable;
 
 /**
- * Compares MySQL and Elasticsearch on the same queries against the same data.
+ * Compares every registered autocomplete method on the same queries against the
+ * same data.
  *
  * Two questions, because either one alone is misleading: how fast is it, and is
  * the answer any good. A fast engine that ranks "Kerkstraat, 2060 Antwerpen"
@@ -27,14 +28,25 @@ use Throwable;
  * an autocomplete at all.
  *
  * Quality is measured twice. Engine agreement needs no ground truth and covers
- * the whole query set: wherever the two engines disagree is where a human has
- * to look. The golden set is hand-curated ground truth over a couple of dozen
+ * the whole query set: wherever two engines disagree is where a human has to
+ * look. The golden set is hand-curated ground truth over a couple of dozen
  * known-item queries and is the only measure that can say which engine is
  * right rather than merely different.
+ *
+ * Agreement is pairwise by nature, and with six methods the full matrix is
+ * fifteen pairs -- unreadable, and mostly answering questions nobody asked.
+ * Instead every selected engine is compared against *one* baseline, the first
+ * one selected, which turns the matrix into one row per engine and makes the
+ * question concrete: "how far does this method drift from the thing it would
+ * replace?". Selection order is preserved precisely so the caller picks that
+ * baseline: the default --engine=all starts at mysql, so every method is scored
+ * against the store we are trying to move off; --engine=elasticsearch,es-sayt
+ * instead scores the candidate against the incumbent ES mapping, which is the
+ * comparison that matters once MySQL is out of the picture.
  */
 #[AsCommand(
     name: 'benchmark',
-    description: 'Benchmark MySQL against Elasticsearch on latency and result quality',
+    description: 'Benchmark the autocomplete methods against each other on latency and result quality',
 )]
 final class BenchmarkCommand extends Command
 {
@@ -51,8 +63,17 @@ final class BenchmarkCommand extends Command
             ->addOption('iterations', null, InputOption::VALUE_REQUIRED, 'Timed runs per query per engine', '20')
             ->addOption('warmup', null, InputOption::VALUE_REQUIRED, 'Discarded runs per query per engine', '5')
             ->addOption('limit', null, InputOption::VALUE_REQUIRED, 'Suggestions requested per query', '10')
-            ->addOption('engine', null, InputOption::VALUE_REQUIRED, 'all|mysql|elasticsearch', 'all')
-            ->addOption('no-fuzzy', null, InputOption::VALUE_NONE, 'Disable fuzzy matching on both engines')
+            ->addOption(
+                'engine',
+                null,
+                InputOption::VALUE_REQUIRED,
+                sprintf(
+                    'all|es|<method>, comma separated; the first one is the agreement baseline (methods: %s)',
+                    implode(', ', $this->container->methodKeys()),
+                ),
+                'all',
+            )
+            ->addOption('no-fuzzy', null, InputOption::VALUE_NONE, 'Disable fuzzy matching on every engine')
             ->addOption('format', null, InputOption::VALUE_REQUIRED, 'table|json|csv', 'table');
     }
 
@@ -112,6 +133,12 @@ final class BenchmarkCommand extends Command
             $io->title('Benchmark');
             $io->definitionList(
                 ['engines' => implode(', ', array_keys($suggesters))],
+                // Spelled out because it is a silent consequence of the order
+                // of --engine, and because an engine that dropped out as
+                // unavailable moves it to the next one still standing.
+                ['agreement baseline' => count($suggesters) > 1
+                    ? (string) array_key_first($suggesters)
+                    : 'n/a (needs two engines)'],
                 ['queries' => sprintf('%d from %s', count($queries), (string) $input->getOption('queries'))],
                 ['golden entries' => sprintf('%d from %s', count($golden), (string) $input->getOption('golden'))],
                 ['iterations' => sprintf('%d timed, %d warmup', $iterations, $warmup)],
@@ -179,10 +206,12 @@ final class BenchmarkCommand extends Command
      * those caches are permanently warm.
      *
      * The timed loop alternates the engines on every single query rather than
-     * running the whole MySQL set and then the whole Elasticsearch set. A GC
-     * pause, a noisy neighbour on the host or a background merge then lands on
-     * both engines roughly equally instead of being charged entirely to
-     * whichever one happened to be running at the time.
+     * running one engine's whole set and then the next one's. A GC pause, a
+     * noisy neighbour on the host or a background merge then lands on all
+     * engines roughly equally instead of being charged entirely to whichever
+     * one happened to be running at the time. That matters more with six
+     * engines than with two: the run is three times longer, so there is three
+     * times as much opportunity for the machine to change underneath it.
      *
      * @param array<string, SuggesterInterface>            $suggesters
      * @param list<string>                                 $queries
@@ -395,89 +424,118 @@ final class BenchmarkCommand extends Command
     }
 
     /**
-     * How much the two engines agree, per query.
+     * How far each engine drifts from the baseline, per query.
      *
      * No ground truth needed, which is what makes this measure worth having:
      * it covers every query in the file, not just the couple of dozen someone
      * had the patience to curate. It cannot tell you who is right, only where
      * to look.
      *
+     * Star-shaped rather than all-pairs. Fifteen pairwise comparisons over six
+     * engines is a matrix nobody reads, and the interesting question is not
+     * "how much do es-sayt and es-completion resemble each other" but "how far
+     * has each candidate moved from the thing it is replacing". The baseline is
+     * the first engine that actually ran, i.e. the first one named in --engine
+     * minus any that turned out to be unavailable -- so the default `all` keeps
+     * measuring everything against MySQL exactly as this report always did,
+     * while `--engine=elasticsearch,es-prefixes,es-sayt` re-centres it on the
+     * incumbent ES mapping without needing a second option to say so.
+     *
+     * With a single engine there is no baseline to compare against and every
+     * aggregate would be a division by zero; the report comes back empty and
+     * the renderers say so rather than printing zeroes that look like total
+     * disagreement.
+     *
      * @param list<string>                                   $queries
      * @param array<string, array<string, list<Suggestion>>> $captured
      *
-     * @return array{engines: list<string>, per_query: list<array<string, mixed>>, mean_overlap: float, mean_jaccard: float, mean_spearman: float|null, identical_top1: int, comparable: int}
+     * @return array{baseline: string|null, engines: list<string>, comparable: int, per_engine: array<string, array<string, mixed>>, per_query: list<array<string, mixed>>}
      */
     private function agreementReport(array $queries, array $captured, int $k): array
     {
         $engines = array_keys($captured);
+        $baseline = $engines === [] ? null : (string) $engines[0];
+        $compared = array_values(array_slice($engines, 1));
 
-        if (count($engines) !== 2) {
-            return [
-                'engines' => $engines,
-                'per_query' => [],
-                'mean_overlap' => 0.0,
-                'mean_jaccard' => 0.0,
-                'mean_spearman' => null,
-                'identical_top1' => 0,
-                'comparable' => 0,
-            ];
-        }
-
-        [$a, $b] = $engines;
         $rows = [];
-        $overlaps = [];
-        $jaccards = [];
-        $spearmans = [];
-        $sameTop1 = 0;
+        $perEngine = [];
+        /** @var array<string, true> $comparableQueries */
+        $comparableQueries = [];
 
-        foreach ($queries as $query) {
-            $left = $this->ids($captured[$a][$query] ?? []);
-            $right = $this->ids($captured[$b][$query] ?? []);
+        foreach ($compared as $engine) {
+            $overlaps = [];
+            $jaccards = [];
+            $spearmans = [];
+            $sameTop1 = 0;
 
-            if ($left === [] && $right === []) {
-                continue;
+            foreach ($queries as $query) {
+                $left = $this->ids($captured[(string) $baseline][$query] ?? []);
+                $right = $this->ids($captured[$engine][$query] ?? []);
+
+                // Neither side has an opinion: counting that as perfect
+                // agreement would let a pair of broken engines score 1.000.
+                if ($left === [] && $right === []) {
+                    continue;
+                }
+
+                $topK = array_slice($left, 0, $k);
+                $topKOther = array_slice($right, 0, $k);
+                $shared = array_values(array_intersect($topK, $topKOther));
+                $union = array_values(array_unique([...$topK, ...$topKOther]));
+
+                $overlap = count($shared);
+                $jaccard = $union === [] ? 0.0 : $overlap / count($union);
+                $spearman = $this->spearman($topK, $topKOther);
+                $identical = ($left[0] ?? null) !== null && ($left[0] ?? null) === ($right[0] ?? null);
+
+                if ($identical) {
+                    ++$sameTop1;
+                }
+
+                $overlaps[] = $overlap;
+                $jaccards[] = $jaccard;
+
+                if ($spearman !== null) {
+                    $spearmans[] = $spearman;
+                }
+
+                $comparableQueries[$query] = true;
+
+                $rows[] = [
+                    'engine' => $engine,
+                    'query' => $query,
+                    'overlap' => $overlap,
+                    'k' => min($k, max(count($topK), count($topKOther))),
+                    'jaccard' => $jaccard,
+                    'spearman' => $spearman,
+                    'same_top1' => $identical,
+                    'baseline_top1' => $this->label($captured[(string) $baseline][$query] ?? []),
+                    'top1' => $this->label($captured[$engine][$query] ?? []),
+                ];
             }
 
-            $topK = array_slice($left, 0, $k);
-            $topKOther = array_slice($right, 0, $k);
-            $shared = array_values(array_intersect($topK, $topKOther));
-            $union = array_values(array_unique([...$topK, ...$topKOther]));
-
-            $overlap = count($shared);
-            $jaccard = $union === [] ? 0.0 : $overlap / count($union);
-            $spearman = $this->spearman($topK, $topKOther);
-            $identical = ($left[0] ?? null) !== null && ($left[0] ?? null) === ($right[0] ?? null);
-
-            if ($identical) {
-                ++$sameTop1;
-            }
-
-            $overlaps[] = $overlap;
-            $jaccards[] = $jaccard;
-
-            if ($spearman !== null) {
-                $spearmans[] = $spearman;
-            }
-
-            $rows[] = [
-                'query' => $query,
-                'overlap' => $overlap,
-                'k' => min($k, max(count($topK), count($topKOther))),
-                'jaccard' => $jaccard,
-                'spearman' => $spearman,
-                'same_top1' => $identical,
-                'top1' => [$a => $this->label($captured[$a][$query] ?? []), $b => $this->label($captured[$b][$query] ?? [])],
+            $perEngine[$engine] = [
+                'engine' => $engine,
+                'comparable' => count($overlaps),
+                'mean_overlap' => $overlaps === [] ? 0.0 : array_sum($overlaps) / count($overlaps),
+                'mean_jaccard' => $jaccards === [] ? 0.0 : array_sum($jaccards) / count($jaccards),
+                // null, not 0.0: "no two shared ids anywhere, so rank
+                // correlation is undefined" is a different statement from
+                // "the rankings are uncorrelated".
+                'mean_spearman' => $spearmans === [] ? null : array_sum($spearmans) / count($spearmans),
+                'identical_top1' => $sameTop1,
             ];
         }
 
         return [
-            'engines' => [$a, $b],
+            'baseline' => $baseline,
+            'engines' => $compared,
+            // Distinct queries, not rows: with five compared engines the row
+            // count is five times the number of queries, which would make
+            // "queries compared" nonsense in the header.
+            'comparable' => count($comparableQueries),
+            'per_engine' => $perEngine,
             'per_query' => $rows,
-            'mean_overlap' => $overlaps === [] ? 0.0 : array_sum($overlaps) / count($overlaps),
-            'mean_jaccard' => $jaccards === [] ? 0.0 : array_sum($jaccards) / count($jaccards),
-            'mean_spearman' => $spearmans === [] ? null : array_sum($spearmans) / count($spearmans),
-            'identical_top1' => $sameTop1,
-            'comparable' => count($rows),
         ];
     }
 
@@ -615,40 +673,70 @@ final class BenchmarkCommand extends Command
         $verdict = [];
         $overall = $latency['overall'];
 
-        if (count($overall) === 2) {
-            $engines = array_keys($overall);
+        if ($overall !== []) {
             $byP50 = $overall;
             uasort($byP50, static fn (array $x, array $y): int => $x['p50'] <=> $y['p50']);
-            $fast = array_key_first($byP50);
-            $slow = array_key_last($byP50);
-            $slowP50 = (float) $overall[$slow]['p50'];
+            $fast = (string) array_key_first($byP50);
+            $slow = (string) array_key_last($byP50);
             $fastP50 = (float) $overall[$fast]['p50'];
+            $fastP95 = (float) $overall[$fast]['p95'];
+            $comparable = count($overall) > 1;
+
+            // Fastest-first, not selection order: with six engines the useful
+            // thing to read off the verdict is the ranking, and the selection
+            // order is already the order of every table above.
+            $p50 = [];
+
+            foreach ($byP50 as $engine => $stats) {
+                $p50[$engine] = $stats['p50'];
+            }
 
             $verdict['latency'] = [
-                'faster' => $fast,
-                'p50_factor' => $fastP50 > 0 ? round($slowP50 / $fastP50, 2) : null,
-                'p95_factor' => (float) $overall[$fast]['p95'] > 0
-                    ? round((float) $overall[$slow]['p95'] / (float) $overall[$fast]['p95'], 2)
-                    : null,
-                'p50_ms' => [$engines[0] => $overall[$engines[0]]['p50'], $engines[1] => $overall[$engines[1]]['p50']],
+                'fastest' => $fast,
+                'slowest' => $comparable ? $slow : null,
+                // The spread between the extremes. Reporting a factor per
+                // engine would be five numbers saying the same thing; the
+                // p50_ms ranking below is where per-engine detail belongs.
+                'p50_factor' => $comparable && $fastP50 > 0 ? round((float) $overall[$slow]['p50'] / $fastP50, 2) : null,
+                'p95_factor' => $comparable && $fastP95 > 0 ? round((float) $overall[$slow]['p95'] / $fastP95, 2) : null,
+                'p50_ms' => $p50,
             ];
         }
 
-        $hits = [];
+        /** @var array<string, array<string, float|int>> $hits */
+        $hits = $quality['per_engine'];
 
-        foreach ($quality['per_engine'] as $engine => $scores) {
-            $hits[$engine] = $scores;
-        }
+        if ($hits !== []) {
+            // A tie for the lead names nobody rather than the first engine to
+            // reach the score: with six engines on a couple of dozen golden
+            // entries, ties at the top are the normal case, and quietly
+            // awarding them to whichever one was listed first would invent a
+            // winner out of the --engine order.
+            $best = null;
+            $bestScore = -1;
+            $tied = false;
 
-        if (count($hits) === 2) {
-            $engines = array_keys($hits);
-            $best = $hits[$engines[0]]['hit@10'] <=> $hits[$engines[1]]['hit@10'];
+            foreach ($hits as $engine => $scores) {
+                $score = (int) $scores['hit@10'];
+
+                if ($score > $bestScore) {
+                    $best = (string) $engine;
+                    $bestScore = $score;
+                    $tied = false;
+
+                    continue;
+                }
+
+                if ($score === $bestScore) {
+                    $tied = true;
+                }
+            }
 
             $verdict['golden'] = [
-                'more_hits' => $best === 0 ? null : ($best > 0 ? $engines[0] : $engines[1]),
-                'hit@10' => [$engines[0] => $hits[$engines[0]]['hit@10'], $engines[1] => $hits[$engines[1]]['hit@10']],
-                'hit@1' => [$engines[0] => $hits[$engines[0]]['hit@1'], $engines[1] => $hits[$engines[1]]['hit@1']],
-                'mrr' => [$engines[0] => round((float) $hits[$engines[0]]['mrr'], 4), $engines[1] => round((float) $hits[$engines[1]]['mrr'], 4)],
+                'more_hits' => $tied ? null : $best,
+                'hit@10' => array_map(static fn (array $s): int => (int) $s['hit@10'], $hits),
+                'hit@1' => array_map(static fn (array $s): int => (int) $s['hit@1'], $hits),
+                'mrr' => array_map(static fn (array $s): float => round((float) $s['mrr'], 4), $hits),
             ];
         }
 
@@ -715,19 +803,34 @@ final class BenchmarkCommand extends Command
             $io->comment('Run with -v for the per-query latency breakdown.');
         }
 
-        /** @var array{engines: list<string>, per_query: list<array<string, mixed>>, mean_overlap: float, mean_jaccard: float, mean_spearman: float|null, identical_top1: int, comparable: int} $agreement */
+        /** @var array{baseline: string|null, engines: list<string>, comparable: int, per_engine: array<string, array<string, mixed>>, per_query: list<array<string, mixed>>} $agreement */
         $agreement = $payload['agreement'];
 
-        if ($agreement['comparable'] > 0 && count($agreement['engines']) === 2) {
-            [$a, $b] = $agreement['engines'];
+        if ($agreement['per_engine'] === []) {
+            $io->section('Engine agreement');
+            $io->text('Only one engine ran, so there is nothing to compare it against.');
+        } else {
+            $baseline = (string) $agreement['baseline'];
 
-            $io->section(sprintf('Engine agreement (%s vs %s, k=%d)', $a, $b, $k));
-            $io->definitionList(
-                ['queries compared' => (string) $agreement['comparable']],
-                ['mean overlap@k' => sprintf('%.2f of %d', $agreement['mean_overlap'], $k)],
-                ['mean Jaccard' => sprintf('%.3f', $agreement['mean_jaccard'])],
-                ['mean Spearman (shared ids)' => $agreement['mean_spearman'] === null ? 'n/a' : sprintf('%.3f', $agreement['mean_spearman'])],
-                ['identical top-1' => sprintf('%d of %d', $agreement['identical_top1'], $agreement['comparable'])],
+            $io->section(sprintf('Engine agreement (baseline %s, k=%d)', $baseline, $k));
+            $io->text(sprintf(
+                '%d queries were comparable: %s or the other engine returned something for them.',
+                $agreement['comparable'],
+                $baseline,
+            ));
+            $io->table(
+                ['engine', 'compared', 'mean overlap@' . $k, 'mean Jaccard', 'mean Spearman', 'identical top-1'],
+                array_map(
+                    static fn (array $s): array => [
+                        (string) $s['engine'],
+                        (string) $s['comparable'],
+                        sprintf('%.2f of %d', (float) $s['mean_overlap'], $k),
+                        sprintf('%.3f', (float) $s['mean_jaccard']),
+                        $s['mean_spearman'] === null ? 'n/a' : sprintf('%.3f', (float) $s['mean_spearman']),
+                        sprintf('%d of %d', (int) $s['identical_top1'], (int) $s['comparable']),
+                    ],
+                    array_values($agreement['per_engine']),
+                ),
             );
 
             $disagreements = array_values(array_filter(
@@ -735,27 +838,33 @@ final class BenchmarkCommand extends Command
                 static fn (array $row): bool => !$row['same_top1'] || $row['overlap'] < $row['k'],
             ));
 
+            // Worst first, and with five engines the same query shows up once
+            // per engine: that repetition is the signal, because a query every
+            // engine disagrees with the baseline on is a query where the
+            // baseline itself is probably the odd one out.
             usort($disagreements, static fn (array $x, array $y): int => $x['overlap'] <=> $y['overlap']);
 
             $shown = $output->isVerbose() ? $disagreements : array_slice($disagreements, 0, 20);
 
             if ($shown !== []) {
                 $io->text(sprintf(
-                    'Queries where the engines disagree (%d of %d, %s):',
+                    'Engine/query pairs that disagree with %s (%d of %d, %s):',
+                    $baseline,
                     count($disagreements),
-                    $agreement['comparable'],
+                    count($agreement['per_query']),
                     $output->isVerbose() ? 'all shown' : 'worst 20 shown, -v for all',
                 ));
                 $io->table(
-                    ['query', 'overlap', 'jaccard', 'spearman', 'top1 ' . $a, 'top1 ' . $b],
+                    ['engine', 'query', 'overlap', 'jaccard', 'spearman', 'top1 ' . $baseline, 'top1 engine'],
                     array_map(
                         static fn (array $row): array => [
-                            $row['query'],
+                            (string) $row['engine'],
+                            (string) $row['query'],
                             sprintf('%d/%d', $row['overlap'], $row['k']),
                             sprintf('%.2f', $row['jaccard']),
                             $row['spearman'] === null ? '-' : sprintf('%.2f', $row['spearman']),
-                            $row['top1'][$a] ?? '-',
-                            $row['top1'][$b] ?? '-',
+                            (string) $row['baseline_top1'],
+                            (string) $row['top1'],
                         ],
                         $shown,
                     ),
@@ -807,7 +916,7 @@ final class BenchmarkCommand extends Command
 
             $headers[] = 'tests';
 
-            $io->text(sprintf('Golden entries not ranked first by both engines (%d of %d):', count($misses), count($quality['per_entry'])));
+            $io->text(sprintf('Golden entries not ranked first by every engine (%d of %d):', count($misses), count($quality['per_entry'])));
             $io->table(
                 $headers,
                 array_map(
@@ -840,12 +949,15 @@ final class BenchmarkCommand extends Command
         if (isset($verdict['latency'])) {
             /** @var array<string, mixed> $l */
             $l = $verdict['latency'];
-            $lines[] = sprintf(
-                'Latency: %s is faster, %sx at p50 and %sx at p95.',
-                (string) $l['faster'],
-                $l['p50_factor'] === null ? '?' : (string) $l['p50_factor'],
-                $l['p95_factor'] === null ? '?' : (string) $l['p95_factor'],
-            );
+            $lines[] = $l['slowest'] === null
+                ? sprintf('Latency: only %s ran, so there is nothing to compare it to.', (string) $l['fastest'])
+                : sprintf(
+                    'Latency: %s is fastest and %s slowest, %sx at p50 and %sx at p95 between them.',
+                    (string) $l['fastest'],
+                    (string) $l['slowest'],
+                    $l['p50_factor'] === null ? '?' : (string) $l['p50_factor'],
+                    $l['p95_factor'] === null ? '?' : (string) $l['p95_factor'],
+                );
 
             foreach ((array) $l['p50_ms'] as $engine => $value) {
                 $lines[] = sprintf('  %s p50 %s ms', (string) $engine, $this->ms((float) $value));
@@ -856,8 +968,8 @@ final class BenchmarkCommand extends Command
             /** @var array<string, mixed> $g */
             $g = $verdict['golden'];
             $lines[] = $g['more_hits'] === null
-                ? 'Golden set: both engines produced the same number of hit@10.'
-                : sprintf('Golden set: %s produced more hit@10.', (string) $g['more_hits']);
+                ? 'Golden set: no single engine leads on hit@10.'
+                : sprintf('Golden set: %s produced the most hit@10.', (string) $g['more_hits']);
 
             foreach ((array) $g['hit@10'] as $engine => $value) {
                 $lines[] = sprintf(
@@ -923,14 +1035,35 @@ final class BenchmarkCommand extends Command
             }
         }
 
-        /** @var array{per_query: list<array<string, mixed>>} $agreement */
+        /** @var array{baseline: string|null, per_engine: array<string, array<string, mixed>>, per_query: list<array<string, mixed>>} $agreement */
         $agreement = $payload['agreement'];
 
+        // The engine column now carries the *compared* engine; which engine it
+        // was compared against is a property of the whole run, so it is emitted
+        // once as its own row rather than repeated on every line. Without it a
+        // saved CSV is unreadable six months later, because nothing else in the
+        // file says what the agreement numbers are agreement with.
+        if ($agreement['baseline'] !== null) {
+            fputcsv($handle, ['agreement_overall', $agreement['baseline'], '', 'is_baseline', '1'], ',', '"', '');
+        }
+
+        foreach ($agreement['per_engine'] as $engine => $stats) {
+            foreach ($stats as $metric => $value) {
+                if ($metric === 'engine') {
+                    continue;
+                }
+
+                fputcsv($handle, ['agreement_overall', (string) $engine, '', $metric, $value === null ? '' : (string) $value], ',', '"', '');
+            }
+        }
+
         foreach ($agreement['per_query'] as $row) {
-            fputcsv($handle, ['agreement', '', $row['query'], 'overlap', (string) $row['overlap']], ',', '"', '');
-            fputcsv($handle, ['agreement', '', $row['query'], 'jaccard', sprintf('%.4f', $row['jaccard'])], ',', '"', '');
-            fputcsv($handle, ['agreement', '', $row['query'], 'spearman', $row['spearman'] === null ? '' : sprintf('%.4f', $row['spearman'])], ',', '"', '');
-            fputcsv($handle, ['agreement', '', $row['query'], 'same_top1', $row['same_top1'] ? '1' : '0'], ',', '"', '');
+            $engine = (string) $row['engine'];
+
+            fputcsv($handle, ['agreement', $engine, $row['query'], 'overlap', (string) $row['overlap']], ',', '"', '');
+            fputcsv($handle, ['agreement', $engine, $row['query'], 'jaccard', sprintf('%.4f', $row['jaccard'])], ',', '"', '');
+            fputcsv($handle, ['agreement', $engine, $row['query'], 'spearman', $row['spearman'] === null ? '' : sprintf('%.4f', $row['spearman'])], ',', '"', '');
+            fputcsv($handle, ['agreement', $engine, $row['query'], 'same_top1', $row['same_top1'] ? '1' : '0'], ',', '"', '');
         }
 
         /** @var array{per_engine: array<string, array<string, float|int>>, per_entry: list<array<string, mixed>>} $quality */
@@ -986,6 +1119,12 @@ final class BenchmarkCommand extends Command
     /**
      * Lazy per engine so a dead Elasticsearch still lets the MySQL numbers out.
      *
+     * The result keeps the selection order, which is what makes the first
+     * surviving engine the agreement baseline. An engine that drops out here
+     * therefore hands the baseline to the next one along -- deliberate: a run
+     * against a baseline that produced no results at all would report total
+     * disagreement everywhere and mean nothing.
+     *
      * @param list<string>          $engines
      * @param array<string, string> $unavailable
      *
@@ -993,11 +1132,7 @@ final class BenchmarkCommand extends Command
      */
     private function buildSuggesters(array $engines, array &$unavailable): array
     {
-        $factories = [
-            'mysql' => $this->container->mysqlSuggester(...),
-            'elasticsearch' => $this->container->elasticsearchSuggester(...),
-        ];
-
+        $factories = $this->container->suggesters();
         $suggesters = [];
 
         foreach ($engines as $engine) {
@@ -1021,17 +1156,62 @@ final class BenchmarkCommand extends Command
     }
 
     /**
+     * Resolves --engine into an ordered, duplicate-free list of method keys.
+     *
+     * Four shapes, all reducible to the same thing: "all" is the registry,
+     * "es" is every method on the Elasticsearch backend (a group and not a
+     * method, because "run the five ES variants against each other" is the
+     * single most common thing to want and spelling out five hyphenated keys
+     * invites typos), any registry key is itself, and commas combine them.
+     *
+     * Unlike the HTTP endpoint, an unknown token throws instead of falling
+     * back to everything: a typo in a script that silently benchmarks six
+     * engines for twenty minutes instead of the one you meant is worse than an
+     * error, and unlike a hand-edited URL there is no one watching to notice.
+     *
+     * The order the caller typed is preserved -- that is the only thing that
+     * chooses the agreement baseline (see agreementReport()), so canonicalising
+     * it into registry order would silently take that choice away.
+     *
      * @return list<string>
      */
     private function selectedEngines(string $engine): array
     {
-        return match ($engine) {
-            'all' => ['mysql', 'elasticsearch'],
-            'mysql', 'elasticsearch' => [$engine],
-            default => throw new \InvalidArgumentException(
-                sprintf('Unknown --engine "%s", expected all|mysql|elasticsearch.', $engine),
-            ),
-        };
+        /** @var array<string, true> $selected */
+        $selected = [];
+
+        foreach (explode(',', $engine) as $token) {
+            $token = strtolower(trim($token));
+
+            // A trailing or doubled comma is a slip of the finger, not a
+            // request for an engine called "".
+            if ($token === '') {
+                continue;
+            }
+
+            $expanded = match (true) {
+                $token === 'all' => $this->container->methodKeys(),
+                $token === 'es' => $this->container->methodKeysForBackend('elasticsearch'),
+                $this->container->hasMethod($token) => [$token],
+                default => throw new \InvalidArgumentException(sprintf(
+                    'Unknown --engine "%s", expected all|es|%s, optionally comma separated.',
+                    $token,
+                    implode('|', $this->container->methodKeys()),
+                )),
+            };
+
+            foreach ($expanded as $key) {
+                // Keyed, so "mysql,all" runs mysql once and keeps it first
+                // rather than benchmarking it twice.
+                $selected[$key] = true;
+            }
+        }
+
+        if ($selected === []) {
+            throw new \InvalidArgumentException('--engine selected no engine; expected all|es|<method>, optionally comma separated.');
+        }
+
+        return array_map(strval(...), array_keys($selected));
     }
 
     /**
