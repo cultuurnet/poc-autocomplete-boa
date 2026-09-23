@@ -191,7 +191,7 @@ docker compose exec \
 
 ### `benchmark`
 
-Runs the same query set against both engines and reports latency and result quality.
+Runs the same query set against every selected method and reports latency and result quality.
 
 | Option | Default | What it does |
 |---|---|---|
@@ -200,20 +200,21 @@ Runs the same query set against both engines and reports latency and result qual
 | `--iterations` | `20` | Timed runs per query per engine. |
 | `--warmup` | `5` | Runs discarded before timing starts. |
 | `--limit` | `10` | Suggestions requested per query — also the *k* in overlap@k and hit@k. |
-| `--engine` | `all` | Restrict to one engine; the agreement report then has nothing to compare and is skipped. |
-| `--no-fuzzy` | off | Disable fuzzy matching on both engines. The single most interesting switch: MySQL has no native fuzziness, so this is where the two diverge. |
+| `--engine` | `all` | `all` (all six methods), `es` (the five Elasticsearch ones), `mysql`, or any comma-separated list of method keys. **The first one selected is the agreement baseline**, so `--engine=elasticsearch,es-sayt` measures sayt against the incumbent, while the default measures everything against MySQL. A single engine leaves nothing to compare and the agreement report is skipped. |
+| `--no-fuzzy` | off | Disable fuzzy matching on every selected method. The single most interesting switch: MySQL has no native fuzziness, so this is where the two diverge. |
 | `--format` | `table` | `table`, `json` or `csv`. |
 
 ```bash
-make benchmark                          # aggregate latency + quality
+make benchmark                          # aggregate latency + quality, all six methods
+make benchmark ARGS="--engine=es"       # the five Elasticsearch methods against each other
 make benchmark ARGS="-v"                # per-query breakdown
 make benchmark ARGS="--no-fuzzy"        # how much of ES's lead is fuzziness
 make benchmark ARGS="--format=json"     # machine readable
 docker compose exec php php bin/console benchmark --iterations=5 --warmup=2   # fast pass
 ```
 
-Defaults run 106 queries × 2 engines × 25 calls = 5,300 requests; `--iterations=5 --warmup=2`
-cuts that to 1,484 and finishes in a few seconds.
+Defaults now run 106 queries × 6 methods × 25 calls = 15,900 requests, so `--engine=es` or
+`--iterations=5 --warmup=2` is the faster iteration loop.
 
 ### `health`
 
@@ -241,8 +242,13 @@ Exits non-zero if either engine is unhealthy. The same information is available 
 
 ## The comparison UI
 
-`http://localhost:8080` is one search box over two result columns. Per keystroke it shows,
-for each engine:
+`http://localhost:8080` is one search box over two result columns. **Each column has a
+method picker above it**, so the comparison is any method against any other — MySQL against
+the incumbent Elasticsearch query as before, or two Elasticsearch methods against each other.
+Both choices are remembered in `localStorage`, and changing one re-runs only that column and
+resets only that column's rolling median (a median mixing two methods would be a lie).
+
+Per keystroke it shows, for each column:
 
 - the engine's **own measured query time** (`took_ms`, what the API would report) and the
   browser **round-trip time** — the gap between them is HTTP plus PHP overhead, which is not
@@ -342,13 +348,168 @@ popularity. Fuzziness is native.
 The asymmetry in that last sentence is the point of the POC. Read the benchmark output rather
 than this paragraph.
 
+That paragraph describes the **incumbent** Elasticsearch method. It is now one of five, all
+querying the same index and all selectable per column in the UI and per run in the benchmark
+— see [The five Elasticsearch methods](#the-five-elasticsearch-methods).
+
+## The five Elasticsearch methods
+
+Elasticsearch has more than one way to do type-ahead, and they differ mainly in *where* the
+work happens: in the index, or in the query. The four alternatives to the incumbent come from
+Elastic's own overview,
+[Elasticsearch autocomplete search](https://www.elastic.co/search-labs/blog/elasticsearch-autocomplete-search)
+— its *performance consideration* section is the one that matters here — plus `index_prefixes`,
+which that article does not cover but which is the obvious native alternative to a hand-built
+n-gram filter.
+
+All five live in **one index over the same documents**, and they share everything except the
+text-matching clauses: the same `doc_type` filter, `size`, `_source`, the same exact-name,
+postcode, municipality, alias and house-number ranking signals, and the same `function_score`
+with the same popularity damping and per-type weights. The retrieval method is the only
+variable, which is the only reason the numbers below mean anything. Boosts were deliberately
+**not** re-tuned per method: if a method ranks worse, that is the finding.
+
+| key | method | extra index | how the trailing token is matched |
+|---|---|---|---|
+| `elasticsearch` | edge n-grams 1–20 at index time (**the incumbent**) | 12.9 MB | it is already a term — plain `match` |
+| `es-prefixes` | `index_prefixes` 1–19 on a plain text field | 12.9 MB | term lookup in Lucene's hidden `_index_prefix` field |
+| `es-sayt` | `search_as_you_type` (`._2gram`, `._3gram`, `._index_prefix`) | 38.8 MB | `multi_match` / `bool_prefix` across the shingle family |
+| `es-bool-prefix` | **none** — reuses the plain whole-word fields | 0 MB | an honest prefix scan over the term dictionary |
+| `es-completion` | `completion` field (FST) with a `doc_type` context | 6.1 MB | walks the FST from the first character |
+
+`es-completion` is not a search and cannot pretend to be one. The suggest API takes no query
+and no filter beyond its contexts, and ranks **only** by the weight indexed with the document
+(popularity here), never by how well the text matched. It cannot reorder multi-token input,
+cannot see house numbers, and returns no meaningful total. It is in the comparison as the
+latency floor — the number that says what the other four are paying for their flexibility —
+and not as a candidate.
+
+### What the methods cost to index
+
+Same 82,643 documents (street level), force-merged to one segment, measured with
+`POST /<index>/_disk_usage?run_expensive_tasks=true`:
+
+| | index size | import wall clock |
+|---|---|---|
+| incumbent only (the mapping before this change) | 40.8 MB | 23.9 s |
+| all five methods in one index | 107.5 MB | 39.3 s |
+
+That 2.6× is the cost of being able to *compare*, not the cost of shipping any one method.
+Per method, the fields it alone needs:
+
+| method | fields | MB |
+|---|---|---|
+| `es-bool-prefix` | — (reuses `search_text.folded`, `primary_name.folded`) | **0.0** |
+| `es-completion` | `suggest` | 6.1 |
+| `elasticsearch` | `search_text` 8.4 + `primary_name` 4.5 | 12.9 |
+| `es-prefixes` | the two `._index_prefix` structures, 8.4 + 4.5 | 12.9 |
+| `es-sayt` | eight subfields; `search_text_sayt._index_prefix` alone is 24.1 | 38.8 |
+
+Two things worth stating plainly, because this README previously guessed at both:
+
+- **`index_prefixes` is not the cheap option.** At 1–19 it stores very nearly what the edge
+  n-gram filter stores, and costs the same to within 1%. The saving people expect from it
+  comes from the *default* 2–5 range, not from the mechanism. What it does buy is native
+  behaviour: no `MAX_GRAM` cliff and no `preserve_original` workaround, because a term longer
+  than `max_chars` still matches, just by scanning.
+- **`search_as_you_type` is expensive**, exactly as the article warns: three times the
+  incumbent's index for this data, most of it the `_index_prefix` of the shingled catch-all
+  field. It is the convenient option, not the cheap one.
+
+### What the methods cost to query
+
+106 queries × 20 iterations, engine-reported `took`, single node, single shard, warm, nothing
+else running:
+
+| method | p50 | p90 | p95 | p99 | max |
+|---|---|---|---|---|---|
+| `elasticsearch` | 2.41 | 4.02 | 5.04 | 8.55 | 62.20 |
+| `es-prefixes` | 2.29 | 3.96 | 5.12 | 7.83 | 36.62 |
+| `es-sayt` | 2.31 | 3.80 | 4.73 | 8.51 | 21.95 |
+| `es-bool-prefix` | 2.32 | 3.93 | 5.07 | 8.45 | 33.22 |
+| `es-completion` | **1.11** | 1.62 | 1.96 | 4.10 | 17.81 |
+
+**At this corpus size the four search methods are indistinguishable.** The method with no
+prefix index at all is as fast at the median as the one paying 12.9 MB for one. That is the
+single most useful result here, and it is not the result the article leads you to expect.
+
+It is not a licence to delete the n-grams, for two reasons. The first is visible in the
+by-length breakdown (median of each query's p50):
+
+| query length | `elasticsearch` | `es-prefixes` | `es-sayt` | `es-bool-prefix` | `es-completion` |
+|---|---|---|---|---|---|
+| 1 char | 4.25 | 3.82 | 3.76 | **5.07** | 1.21 |
+| 2 chars | 1.57 | 1.42 | 1.53 | 1.56 | 1.08 |
+| 3–5 chars | 1.45 | 1.30 | 1.34 | 1.27 | 1.04 |
+| 6+ chars | 2.52 | 2.38 | 2.45 | 2.32 | 1.08 |
+
+The scan only shows up where the article says it will — on the shortest prefixes, where the
+term dictionary walk is widest — and at 82k documents it costs about a millisecond. The
+second reason is that **this was measured at street level, 82,643 documents**. The article's
+warning is about scale, and `--level=address` (3.9M documents) is where it would bite. That
+run has not been done; until it has, "the prefix scan is free" is a statement about this
+corpus and not about this problem.
+
+### Whether the methods are any good
+
+Against the hand-curated golden set (37 known-item queries with expected answers):
+
+| method | hit@1 | hit@3 | hit@10 | MRR |
+|---|---|---|---|---|
+| `es-bool-prefix` | **35 (95%)** | 35 | 37 (100%) | **0.957** |
+| `elasticsearch` | 34 (92%) | 35 | 37 (100%) | 0.943 |
+| `es-prefixes` | 34 (92%) | 35 | 37 (100%) | 0.943 |
+| `es-sayt` | 33 (89%) | 35 | 37 (100%) | 0.929 |
+| `es-completion` | 13 (35%) | 14 | 14 (38%) | 0.365 |
+
+And against the incumbent as baseline, over the 105 comparable queries in `queries.txt`:
+
+| method | mean Jaccard@10 | identical top-1 |
+|---|---|---|
+| `es-bool-prefix` | 0.956 | 101 of 105 |
+| `es-sayt` | 0.929 | 100 of 105 |
+| `es-prefixes` | 0.846 | 94 of 105 |
+| `es-completion` | 0.280 | 42 of 105 |
+
+The four search methods agree with each other far more than they differ, and where they
+differ it is almost entirely on **one- and two-character prefixes** (`go`, `k`, `kerk`),
+where nothing in the data justifies one ordering over another and the ranking is decided by
+tie-breaks. `es-completion` fails the golden set exactly where its design says it must: every
+"street + city" entry is a miss, because the FST only matches a prefix of a single indexed
+name and "kerkstraat gent" is a prefix of nothing. It wins the three entries that are bare
+locality names, because ranking by popularity alone is the right answer for those.
+
+One recall asymmetry is by design and should not be "fixed": edge n-grams make *every* token
+a prefix, while `match_bool_prefix` makes only the last one a prefix. So `korte linden`
+matches 5 documents through the incumbent's gate and 3 through the others — higher recall,
+lower precision. Which is better is a product question the numbers are meant to inform.
+
+### What this says
+
+- The hand-built edge-n-gram chain is **not** earning its complexity on this corpus. The
+  honest query-time baseline matches it on latency, beats it slightly on the golden set, and
+  costs nothing to index.
+- If the n-grams go, `es-prefixes` is the better swap than `es-sayt`: a third of the index for
+  the same behaviour, and it retires the `MAX_GRAM` cliff.
+- `es-completion` is a genuine sub-millisecond floor and a genuinely different product: right
+  for a "jump to a city" box, wrong for address lookup.
+- **Before acting on any of this, re-run it at `--level=address`.** Everything above is one
+  corpus, one shard, one node, no concurrency.
+
+Reproduce with:
+
+```bash
+make benchmark ARGS="--engine=es --iterations=20"
+```
+
 ## Layout
 
 ```
 bin/console              CLI entrypoint (import, benchmark, health)
 src/Command/             the three commands + the shared --csv option
 src/Import/              CSV reading, aggregation, the two indexers
-src/Suggest/             the two suggesters behind one interface
+src/Suggest/             six suggesters behind one interface: MySQL, plus five
+                         Elasticsearch methods over two abstract base classes
 src/Model/               engine-agnostic query and result types
 src/Support/Normalizer   the folding both engines share
 src/Http/                the JSON API
@@ -431,6 +592,13 @@ is a genuine behavioural difference and not two spellings of the same ranking. M
 disqualified — at street level it is fast and returns a sensible list for well-spelled input,
 and it needs no extra infrastructure. If the endpoint ever had to ship without a new service
 to operate, it would do. It just loses on the axis that matters most for this feature.
+
+**"Elasticsearch" now means one of five methods.** The recommendation above was measured
+with the incumbent edge-n-gram method and still stands, but the follow-up question — which
+Elasticsearch method — has its own answer, and it is not the obvious one: the method with no
+prefix index at all matches the incumbent on latency and slightly beats it on the golden set
+at this corpus size. See [The five Elasticsearch methods](#the-five-elasticsearch-methods),
+and read the scale caveat there before acting on it.
 
 Neither result speaks to the two modelling questions still open — how UDB3 places should rank
 against addresses, and whether house-number labels get indexed. Both land the same way on
@@ -566,7 +734,7 @@ These need a reindex, with one exception.
 |---|---|
 | **Search-time synonyms** (`synonym_graph`) | `st↔sint`, `str↔straat`, `dr↔dokter`, `stwg↔steenweg`, `o l v↔onze lieve vrouw`. Belgian address search lives on these abbreviations. As a search-only analyzer this is the one item here that needs **no reindex**. |
 | **Dutch decompounding** (`dictionary_decompounder`) | Edge n-grams are prefixes only, so `straat` never finds `Lindenstraat`. Dutch compounds make infix matching a real gap; a targeted street-suffix word list is much cheaper than a full n-gram field. |
-| **`index_prefixes`** instead of the edge-n-gram filter | Native, substantially smaller index, and it retires both the `MAX_GRAM = 20` cliff and the `preserve_original` workaround that exists to paper over it (`ElasticsearchMapping.php:28`, `:95`). |
+| ~~**`index_prefixes`** instead of the edge-n-gram filter~~ **Done and measured** — it is the `es-prefixes` method. It does retire the `MAX_GRAM = 20` cliff and the `preserve_original` workaround, but "substantially smaller index" was wrong: at 1–19 it costs the same as the n-grams to within 1%. See [What the methods cost to index](#what-the-methods-cost-to-index). |
 | **`similarity: boolean`** + `index_options: docs` on `search_text` | It is a pure recall gate, yet its BM25 term frequency still leaks into the final score as noise — and TF is close to meaningless on an n-grammed field anyway. |
 | **Phonetic matching** (`analysis-phonetic`) | Cologne phonetic or Double Metaphone is a recall tier that is *more precise* than edit distance for proper names: `sint niklaas` / `sint niclaas`. |
 
@@ -577,15 +745,16 @@ it ever goes in, it goes in on both sides or the benchmark stops meaning anythin
 
 ### Alternative shapes worth a number
 
-Not improvements to the current query so much as baselines it should be measured against.
+**Two of the three now have their number** — they are implemented as the `es-sayt` and
+`es-completion` methods, and measured in
+[The five Elasticsearch methods](#the-five-elasticsearch-methods). In short: the honest
+control says the hand-built n-gram chain is *not* earning its complexity on this corpus, and
+the FST floor is 1.11 ms at p50 against 2.41 ms for the incumbent. The geo context on the
+completion field was left out — documents without coordinates become unreachable as soon as a
+geo context is queried, which is a trap worth avoiding until geo is actually used.
 
-- **`search_as_you_type` + `multi_match: bool_prefix`** replaces the whole hand-built n-gram
-  setup with one field type. This is an honest control: if it scores the same, the custom
-  analysis chain in `ElasticsearchMapping.php` is not earning its complexity.
-- **The completion suggester (FST), with contexts** on `doc_type` and geo, plus per-document
-  weights. Sub-millisecond — the latency floor. Not shippable on its own (no multi-token
-  reordering, no filtering beyond contexts), but it is the number that shows what the flexible
-  query actually costs.
+Still unmeasured:
+
 - **`rescore`** — cheap gate over the window, expensive phrase-prefix and geo clauses only
   across the top N. This is the mechanism that keeps a `--level=address` index of 3.9M
   documents viable rather than merely possible.
