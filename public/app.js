@@ -28,10 +28,27 @@
 
 const COLUMNS = ['left', 'right'];
 
-/** First visit: the page looks exactly like the old MySQL-vs-ES comparison. */
-const DEFAULT_METHOD = { left: 'mysql', right: 'elasticsearch' };
+/**
+ * The two methods still worth arguing about, so the page opens on the actual
+ * decision rather than on a settled one.
+ *
+ * es-prefixes is the best indexed method: it matches or beats the incumbent
+ * edge-n-gram chain on every axis measured, for the same index, and needs no
+ * MAX_GRAM cliff or preserve_original workaround. es-bool-prefix is the best
+ * method with no prefix index at all - highest golden-set score of the five at
+ * both corpus sizes, indistinguishable at the median, 0 MB and no import cost -
+ * and it loses only on the first two keystrokes, where its term-dictionary scan
+ * runs 3.2x slower at four million documents.
+ *
+ * That trade is what the two columns are for. MySQL and the incumbent are one
+ * click away in either picker; they are just not open questions any more.
+ */
+const DEFAULT_METHOD = { left: 'es-prefixes', right: 'es-bool-prefix' };
 
-const STORAGE_KEY = 'poc-autocomplete:columns';
+// Bumped with the defaults above: a stored pair from before this change would
+// otherwise keep showing the old comparison to everyone who has already opened
+// the page, which is precisely the audience the defaults are for.
+const STORAGE_KEY = 'poc-autocomplete:columns:v2';
 const DEBOUNCE_MS = 120;
 const HISTORY_SIZE = 20;
 

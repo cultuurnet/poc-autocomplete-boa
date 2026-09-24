@@ -354,6 +354,14 @@ Exits non-zero if either engine is unhealthy. The same information is available 
 `http://localhost:8080` is one search box over two result columns. **Each column has a
 method picker above it**, so the comparison is any method against any other — MySQL against
 the incumbent Elasticsearch query as before, or two Elasticsearch methods against each other.
+
+It **opens on `es-prefixes` against `es-bool-prefix`**, because those are the two methods
+still worth arguing about: the best indexed method against the best method with no prefix
+index at all, which is the same question as "is 376 MB and nineteen minutes of import worth
+5 ms on one-character queries?". MySQL and the incumbent edge-n-gram query are one click away
+in either picker; they are just not open questions any more — MySQL is 134× slower at
+house-number level, and the incumbent is matched or beaten by `es-prefixes` on every axis
+measured.
 Both choices are remembered in `localStorage`, and changing one re-runs only that column and
 resets only that column's rolling median (a median mixing two methods would be a lie). The **?** next
 to a column's method name explains in two or three plain sentences what that method actually
