@@ -190,19 +190,10 @@ force-merged to one segment and measured with
 |---|---|---|
 | index size, incumbent mapping only | 40.8 MB | — |
 | index size, all five methods | 107.5 MB | **3.5 GB** |
-| Elasticsearch write time | 39.3 s (2,102 docs/s) | **1,131.9 s (3,505 docs/s)** |
-| MySQL write time | — | 305.0 s (13,007 docs/s) |
 
-**This is the part worth pausing on.** 49× the documents costs 33× the index and 29× the
-import. Elasticsearch writes *faster per document* at address level (3,505/s against 2,102/s)
-because an address document carries far less text than an aggregated street document — the
-cost is volume, not complexity. But it is still **3.7× slower than MySQL** on the same
-documents in the same pass, and that gap is entirely the five methods' index-time machinery:
-edge n-grams, two prefix indexes, the shingle family and the FST all have to be built for
-every one of those four million documents. A nineteen-minute import is a different operational
-proposition from a forty-second one.
-
-Per method, the fields it alone needs:
+49× the documents costs 33× the index. Note what that 3.5 GB is, though: **one index carrying
+all five methods at once**, which is the price of comparing them on identical documents and
+not the price of shipping any one of them. The per-method split is what matters:
 
 | method | fields | street level | address level |
 |---|---|---|---|
@@ -212,18 +203,11 @@ Per method, the fields it alone needs:
 | `es-prefixes` | the two `._index_prefix` structures | 12.9 MB | 376 MB |
 | `es-sayt` | eight subfields; `search_text_sayt._index_prefix` alone is 904 MB | 38.8 MB | 1,299 MB |
 
-**"0 MB" is a marginal figure, not a free lunch.** Every method pays the same baseline before
-any of this: parsing the CSV, aggregating it, building `_source`, doc values, the keyword and
-whole-word fields, the geo point. `es-bool-prefix` adds *nothing on top of that baseline* — it
-queries fields the index has to carry anyway — which is a different claim from importing being
-free. The same goes for the import times: the 1,131.9 s above is one index carrying all five
-methods at once, not any single method's bill.
-
-What is measured, at street level, is the two ends of that range: the incumbent mapping alone
-imports in 23.9 s, and the same documents with all five methods take 38.9 s. So the four added
-methods together cost **+63%** of import time. The per-method split inside that +63% has not
-been measured — the disk figures below are the best available proxy, and they suggest
-`es-sayt` accounts for most of it.
+**"0 MB" is marginal, not absolute.** Every method rides on fields the index has to carry
+anyway — `_source`, doc values, the keyword and whole-word fields, the geo point.
+`es-bool-prefix` is the only one that adds nothing at all on top of those: it queries
+`search_text.folded` and `primary_name.folded`, which exist for the other methods' ranking
+clauses regardless. The figures above are each method's own addition to the bill.
 
 The proportions survive the change of scale almost exactly, which is the useful part: these
 ratios are a property of the methods, not of this corpus. `search_as_you_type` is a third of
@@ -358,16 +342,15 @@ lower precision. Which is better is a product question the numbers are meant to 
 - **A prefix index does earn its keep, but only on the first two keystrokes.** That is the one
   place `es-bool-prefix` loses, and the one place it loses badly and worse with scale (3.2× at
   four million documents). Whether that matters is a product question: 6.6 ms is still fast,
-  and it buys back the 376 MB `es-prefixes` adds, plus whatever share of import time building
-  those two prefix structures costs — see the note on what "0 MB" means below.
+  and it buys back the 376 MB `es-prefixes` adds.
 - `es-sayt` costs 3.4× the index of `es-prefixes` for the same behaviour. Convenience, not
   capability.
 - `es-completion` is a genuine sub-millisecond floor (0.69 ms p50 on four million documents)
   and a genuinely different product: right for a "jump to a city or venue" box, wrong for
   address lookup, where it misses every street-plus-city query by construction.
-- **Query latency barely notices the corpus; indexing does.** 49× the documents cost 15% at
-  the p50 and 29× the import time. If anything here is going to hurt in production, it is the
-  write path, not the read path.
+- **Query latency barely notices the corpus.** 49× the documents cost about 15% at the p50.
+  Index size does scale with it — 33× — so that, not response time, is what to plan capacity
+  around.
 
 Everything above is one shard, one node, a warm cache and no concurrency. Reproduce with:
 

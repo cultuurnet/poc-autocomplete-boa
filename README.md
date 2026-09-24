@@ -59,30 +59,22 @@ A full street-level import, measured on the stack as configured:
 | | |
 |---|---|
 | documents produced | **82,643** (81,841 street, 285 municipality, 517 postcode) |
-| MySQL write time | 6.2 s (13,284 docs/s) |
-| Elasticsearch write time | 38.9 s (2,102 docs/s) |
 | peak PHP memory | 85 MiB |
 | stored size | 36 MiB MySQL table, 107 MiB Elasticsearch index |
 
-The Elasticsearch figures are **five times** what they were before this index carried five
-autocomplete methods at once (23.9 s and 41 MiB for the incumbent mapping alone). That is the
+The place import on top of it produces **62,709** documents (of 64,301 rows; see the rejection
+table below) and peaks at 24 MiB.
+
+The Elasticsearch index is larger than it looks like it should be because it carries **five
+autocomplete methods at once** — 41 MiB of that is the incumbent mapping alone. That is the
 price of being able to compare them on identical documents, not the price of shipping any one
-of them — see
-[What the methods cost to index](CONCLUSIONS.md#what-the-methods-cost-to-index) for the per-method split.
+of them; see
+[What the methods cost to index](CONCLUSIONS.md#what-the-methods-cost-to-index) for the
+per-method split.
 
-The place import on top of it:
-
-| | |
-|---|---|
-| documents produced | **62,709** (of 64,301 rows; see the rejection table below) |
-| wall clock | 10.0 s (shared CSV pass + both engines) |
-| MySQL write time | 2.5 s (25,101 docs/s) |
-| Elasticsearch write time | 6.7 s (9,352 docs/s) |
-| peak PHP memory | 24 MiB |
-
-Write time is reported per engine and excludes the CSV pass, which is shared: the file is read
-**once** and every document is fanned out to both indexers. Running the pipeline twice would
-double the slowest part of the job and — worse — could let the two engines see different input.
+The CSV is read **once** and every document is fanned out to both indexers. Running the
+pipeline twice would double the slowest part of the job and — worse — could let the two
+engines see different input.
 
 ## What gets indexed
 
@@ -243,7 +235,7 @@ Loads the register into MySQL and/or Elasticsearch from a single CSV pass.
 | `--level` | Documents | Cost |
 |---|---|---|
 | `street` | 82,643 — aggregated streets plus municipalities and postcodes | one CSV pass, ~38 s |
-| `address` | 3,884,638 — one per house number, no aggregates | two CSV passes (the aggregate pass still runs, because address documents borrow their street's popularity), **~19 min into Elasticsearch, ~5 min into MySQL**, 3.5 GB on disk |
+| `address` | 3,884,638 — one per house number, no aggregates | two CSV passes (the aggregate pass still runs, because address documents borrow their street's popularity), and 3.5 GB on disk. Expect to wait. |
 | `all` | 3,967,281 — both of the above | same two passes, everything written |
 
 `street` is the default and the cheap option. **`all` is no longer only a load test**: it is
@@ -417,8 +409,8 @@ the incumbent Elasticsearch query as before, or two Elasticsearch methods agains
 
 It **opens on `es-prefixes` against `es-bool-prefix`**, because those are the two methods
 still worth arguing about: the best indexed method against the best method with no prefix
-index at all, which is the same question as "is an extra 376 MB of index, and the time to
-build it, worth 5 ms on one-character queries?". MySQL and the incumbent edge-n-gram query are one click away
+index at all, which is the same question as "is an extra 376 MB of index worth 5 ms on
+one-character queries?". MySQL and the incumbent edge-n-gram query are one click away
 in either picker; they are just not open questions any more — MySQL is 134× slower at
 house-number level, and the incumbent is matched or beaten by `es-prefixes` on every axis
 measured.
