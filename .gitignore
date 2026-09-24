@@ -1,7 +1,9 @@
 /vendor/
 
-# 620 MB source extract, downloaded separately.
-/openaddress-bevlg.csv
+# Source extracts, downloaded separately: 620 MB Flanders, 311 MB Wallonia,
+# 127 MB Brussels. A pattern rather than three names, so the next region does
+# not arrive as a 400 MB accident in someone's `git add -A`.
+/openaddress-*.csv
 
 # 21 MB UiTdatabank place export, exported separately.
 /export_places_udb.csv
