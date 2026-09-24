@@ -9,7 +9,15 @@ use App\Support\NameFormatter;
 use RuntimeException;
 
 /**
- * Reads openaddress-bevlg.csv and yields indexable documents.
+ * Reads one regional openaddress export and yields indexable documents.
+ *
+ * There is one file per region - openaddress-bevlg.csv, -bewal.csv, -bebru.csv -
+ * all with the same header, and a full corpus is the three imported into the
+ * same table/index. They are kept as separate sources rather than concatenated
+ * because every aggregate below is region-local anyway: no postcode, NIS code
+ * or street_id is shared between two regions (only address_id is, see
+ * addressId()), so reading them one at a time produces exactly the aggregates
+ * that reading them together would, and lets --workers run them side by side.
  *
  * The file holds one row per individual address (4.2M of them for Flanders),
  * which is the wrong granularity for most autocomplete queries: nobody types a
@@ -18,6 +26,12 @@ use RuntimeException;
  * coordinate and an address count that doubles as a popularity signal. A second
  * pass, only when house-number level is requested, streams the individual
  * addresses and reuses the counts from pass one for ranking.
+ *
+ * The regions do not agree on which language columns they fill: Flanders fills
+ * only the NL names, Wallonia only the FR ones, Brussels both street names but
+ * no postname at all. Every name here is therefore picked with a fallback
+ * rather than read from one column, and the languages that lost the pick are
+ * kept as aliases so "Liege" and "Luik" both find the same document.
  */
 final class DocumentSource implements DocumentSourceInterface
 {
@@ -123,6 +137,9 @@ final class DocumentSource implements DocumentSourceInterface
                     8 => $lon,
                     9 => 1,
                     10 => $streetId,
+                    11 => trim($row[CsvColumns::MUNICIPALITY_FR]),
+                    12 => trim($row[CsvColumns::MUNICIPALITY_DE]),
+                    13 => trim($row[CsvColumns::POSTNAME_FR]),
                 ];
             }
 
@@ -153,6 +170,9 @@ final class DocumentSource implements DocumentSourceInterface
                     3 => $lat,
                     4 => $lon,
                     5 => 1,
+                    6 => trim($row[CsvColumns::POSTNAME_FR]),
+                    7 => trim($row[CsvColumns::MUNICIPALITY_FR]),
+                    8 => trim($row[CsvColumns::MUNICIPALITY_DE]),
                 ];
             }
 
@@ -194,6 +214,7 @@ final class DocumentSource implements DocumentSourceInterface
             $parts = NameFormatter::postNameParts((string) $s[4]);
             $postName = NameFormatter::displayPostName($parts, $municipality);
             $count = (int) $s[9];
+            $aliasParts = [...$parts, ...NameFormatter::postNameParts((string) $s[13])];
 
             yield new SuggestionDocument(
                 id: 'street:' . $key,
@@ -210,7 +231,12 @@ final class DocumentSource implements DocumentSourceInterface
                 lat: $s[7] / $count,
                 lon: $s[8] / $count,
                 popularity: $count,
-                aliases: $this->aliases([(string) $s[1], (string) $s[2]], $parts, $municipality),
+                aliases: $this->aliases(
+                    [(string) $s[1], (string) $s[2]],
+                    $aliasParts,
+                    $municipality,
+                    [(string) $s[11], (string) $s[12]],
+                ),
             );
         }
     }
@@ -267,6 +293,7 @@ final class DocumentSource implements DocumentSourceInterface
             $parts = NameFormatter::postNameParts((string) $p[0]);
             $postName = NameFormatter::displayPostName($parts, $municipality);
             $count = (int) $p[5];
+            $aliasParts = [...$parts, ...NameFormatter::postNameParts((string) $p[6])];
 
             $label = $postName === '' ? (string) $postcode : $postcode . ' ' . $postName;
 
@@ -285,7 +312,7 @@ final class DocumentSource implements DocumentSourceInterface
                 lat: $p[3] / $count,
                 lon: $p[4] / $count,
                 popularity: $count,
-                aliases: $this->aliases([], $parts, $municipality),
+                aliases: $this->aliases([], $aliasParts, $municipality, [(string) $p[7], (string) $p[8]]),
             );
         }
     }
@@ -328,6 +355,7 @@ final class DocumentSource implements DocumentSourceInterface
             $municipality = NameFormatter::titleCase(trim($row[CsvColumns::MUNICIPALITY_NL]));
             $parts = NameFormatter::postNameParts(trim($row[CsvColumns::POSTNAME_NL]));
             $postName = NameFormatter::displayPostName($parts, $municipality);
+            $aliasParts = [...$parts, ...NameFormatter::postNameParts(trim($row[CsvColumns::POSTNAME_FR]))];
             $houseNumber = trim($row[CsvColumns::HOUSE_NUMBER]);
             $boxNumber = trim($row[CsvColumns::BOX_NUMBER]);
             $streetKey = trim($row[CsvColumns::STREET_ID]) . '|' . $postcode;
@@ -336,7 +364,7 @@ final class DocumentSource implements DocumentSourceInterface
                 . ($boxNumber === '' ? '' : ' bus ' . $boxNumber);
 
             yield new SuggestionDocument(
-                id: 'address:' . trim($row[CsvColumns::ADDRESS_ID]),
+                id: self::addressId($row),
                 type: SuggestionType::Address,
                 label: NameFormatter::addressLine($street, $postcode, $postName, $municipality),
                 placeName: null,
@@ -354,8 +382,9 @@ final class DocumentSource implements DocumentSourceInterface
                 popularity: isset($streets[$streetKey]) ? (int) $streets[$streetKey][9] : 1,
                 aliases: $this->aliases(
                     [trim($row[CsvColumns::STREET_FR]), trim($row[CsvColumns::STREET_DE])],
-                    $parts,
+                    $aliasParts,
                     $municipality,
+                    [trim($row[CsvColumns::MUNICIPALITY_FR]), trim($row[CsvColumns::MUNICIPALITY_DE])],
                 ),
             );
 
@@ -368,20 +397,69 @@ final class DocumentSource implements DocumentSourceInterface
     }
 
     /**
-     * @param list<string> $translations
-     * @param list<string> $postNameParts
+     * Everything besides the primary name that a user might type for this
+     * document: the street name in the other two languages, the postal
+     * localities behind the postcode, and the municipality.
+     *
+     * $municipalityTranslations is the FR/DE spelling of the municipality, and
+     * it is what makes a Walloon or Brussels document findable by the half of
+     * its name the label does not show. The label says "Luik" because
+     * municipality_name_nl is what every region fills, but nobody in Liege
+     * types that, and without the translation here "rue de seraing liege"
+     * matches the street and then loses on the city token it cannot find.
+     * Flanders fills the FR/DE columns for only a handful of municipalities, so
+     * for that region this adds almost nothing - which is why it went unnoticed
+     * until the other two files arrived.
+     *
+     * @param list<string> $translations             the primary name in the other languages
+     * @param list<string> $postNameParts            already split and title-cased
+     * @param list<string> $municipalityTranslations raw FR/DE municipality names
      *
      * @return list<string>
      */
-    private function aliases(array $translations, array $postNameParts, string $municipality): array
-    {
+    private function aliases(
+        array $translations,
+        array $postNameParts,
+        string $municipality,
+        array $municipalityTranslations = [],
+    ): array {
         $aliases = [...$translations, ...$postNameParts];
 
         if ($municipality !== '') {
             $aliases[] = $municipality;
         }
 
+        foreach ($municipalityTranslations as $translation) {
+            $aliases[] = NameFormatter::titleCase($translation);
+        }
+
         return array_values(array_unique(array_filter($aliases, static fn (string $a): bool => $a !== '')));
+    }
+
+    /**
+     * The _id of an address document, qualified by its region.
+     *
+     * address_id is unique within one regional export and nowhere near unique
+     * across them: the three files number their addresses from 1 independently,
+     * and 1.6M ids appear in both the Flemish and the Walloon file. Both
+     * indexers write by document id, so the bare id would have made the second
+     * and third import silently overwrite the first one's addresses instead of
+     * adding to them - a corpus that is smaller than either region alone and
+     * gives no error anywhere.
+     *
+     * Only addresses need this. The postcode, NIS code and street_id|postcode
+     * keys behind the other three document types were checked against all three
+     * files and share nothing, so their ids are left alone and a street-level
+     * import of a new region appends to an existing index untouched.
+     *
+     * @param list<string|null> $row
+     */
+    private static function addressId(array $row): string
+    {
+        $region = trim((string) $row[CsvColumns::REGION_CODE]);
+        $addressId = trim((string) $row[CsvColumns::ADDRESS_ID]);
+
+        return $region === '' ? 'address:' . $addressId : 'address:' . $region . ':' . $addressId;
     }
 
     private function pickName(string $nl, string $fr, string $de): string

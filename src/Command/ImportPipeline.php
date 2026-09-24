@@ -116,12 +116,22 @@ final class ImportPipeline
      * double the slowest part of the job for no reason, and worse, it would let
      * the two engines see subtly different input if the file changed in between.
      *
+     * $finish is what a worker turns off: building the FULLTEXT index and
+     * force-merging the Elasticsearch index are whole-corpus operations, so
+     * with several workers writing into one table they must happen once, in
+     * the parent, after the last worker has exited - not once per worker while
+     * the others are still inserting.
+     *
      * @param array<string, IndexerInterface> $indexers
      *
      * @return array{counts: array<string, int>, nanos: array<string, int>, types: array<string, int>, documents: int, wall: float, peak: int}
      */
-    public function stream(DocumentSourceInterface $source, ImportOptions $options, array $indexers): array
-    {
+    public function stream(
+        DocumentSourceInterface $source,
+        ImportOptions $options,
+        array $indexers,
+        bool $finish = true,
+    ): array {
         $bar = $this->progressBar();
         $phase = 'reading csv';
         $documents = 0;
@@ -187,7 +197,10 @@ final class ImportPipeline
 
             try {
                 $indexer->flush();
-                $indexer->finish();
+
+                if ($finish) {
+                    $indexer->finish();
+                }
             } catch (Throwable $e) {
                 $this->failures[$name] = 'finish failed: ' . $e->getMessage();
             }
@@ -209,6 +222,77 @@ final class ImportPipeline
             'wall' => $wall,
             'peak' => memory_get_peak_usage(true),
         ];
+    }
+
+    /**
+     * Say which file the next stream() call is about.
+     *
+     * Only printed when a run covers more than one, where the progress bar
+     * restarting from zero is otherwise the only clue that the import moved on
+     * to the next region.
+     */
+    public function announce(string $csvPath): void
+    {
+        $this->io->section(sprintf('Reading %s', basename($csvPath)));
+    }
+
+    /**
+     * Add one stream() result into a running total.
+     *
+     * Counts, types and documents add up across files because each file
+     * contributes its own documents. Write time adds up too, and honestly so:
+     * it is time an engine spent writing, whether that came from one file or
+     * three. Wall clock is the exception - it is only additive for files read
+     * one after another, so the parallel path overwrites it with its own
+     * measurement - and peak memory is a high-water mark, not a sum.
+     *
+     * @param array{counts: array<string, int>, nanos: array<string, int>, types: array<string, int>, documents: int, wall: float, peak: int} $total
+     * @param array{counts: array<string, int>, nanos: array<string, int>, types: array<string, int>, documents: int, wall: float, peak: int} $next
+     *
+     * @return array{counts: array<string, int>, nanos: array<string, int>, types: array<string, int>, documents: int, wall: float, peak: int}
+     */
+    public static function mergeResults(array $total, array $next): array
+    {
+        foreach (['counts', 'nanos', 'types'] as $key) {
+            foreach ($next[$key] as $name => $value) {
+                $total[$key][$name] = ($total[$key][$name] ?? 0) + $value;
+            }
+        }
+
+        $total['documents'] += $next['documents'];
+        $total['wall'] += $next['wall'];
+        $total['peak'] = max($total['peak'], $next['peak']);
+
+        return $total;
+    }
+
+    /**
+     * The whole-corpus half of the import, run once after every worker is done.
+     *
+     * Only reached on the multi-worker path: a single-process import finishes
+     * inside stream(), where the cost is already part of that engine's write
+     * time. Here there is no single write path to attribute it to, so it is
+     * timed and reported on its own line instead of being folded into a number
+     * it would distort.
+     *
+     * @param array<string, IndexerInterface> $indexers
+     */
+    public function finishAll(array $indexers): void
+    {
+        foreach ($indexers as $name => $indexer) {
+            $started = hrtime(true);
+
+            try {
+                $indexer->finish();
+                $this->io->text(sprintf(
+                    '%s: built indexes and settled the index in %.1f s.',
+                    $name,
+                    (hrtime(true) - $started) / 1e9,
+                ));
+            } catch (Throwable $e) {
+                $this->failures[$name] = 'finish failed: ' . $e->getMessage();
+            }
+        }
     }
 
     /**
@@ -315,7 +399,12 @@ final class ImportPipeline
         $bar->setFormat(' %phase% | %current% docs | %elapsed:6s% | %docrate% docs/s | mem %memory:6s%');
         $bar->setMessage('starting', 'phase');
         $bar->setRedrawFrequency(self::TICK_EVERY);
-        $bar->minSecondsBetweenRedraws(0.2);
+        // A bar redrawn in place costs nothing on a terminal, but a worker's
+        // stdout is a pipe: there is no cursor to move back, so every redraw
+        // becomes a line the parent has to print. Five a second from each
+        // worker would bury the output that matters, so piped runs report
+        // progress as an occasional status line instead.
+        $bar->minSecondsBetweenRedraws($this->io->isDecorated() ? 0.2 : 10.0);
         $bar->start();
 
         return $bar;

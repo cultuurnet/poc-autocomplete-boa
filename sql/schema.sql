@@ -18,7 +18,7 @@
 --
 -- Why the FULLTEXT index is not part of CREATE TABLE: with the index in place
 -- every INSERT feeds the InnoDB fulltext cache, which is flushed into the
--- auxiliary FTS tables over and over while 4.2M rows stream in. Adding the
+-- auxiliary FTS tables over and over while 6.6M rows stream in. Adding the
 -- index once at the end builds it in a single sorted pass instead, which is
 -- roughly an order of magnitude cheaper. The table is simply not searchable
 -- until the import finishes, which is exactly what MysqlSuggester::health()
@@ -31,10 +31,11 @@ DROP TABLE IF EXISTS `{{table}}`;
 -- @section create
 
 CREATE TABLE IF NOT EXISTS `{{table}}` (
-    -- Ids are machine-made ("street:<id>|<postcode>", "municipality:<nis>"),
-    -- so ASCII is enough. ascii_bin also means the primary key compares
-    -- byte-exact: under the accent-insensitive server collation "Straat:1" and
-    -- "straat:1" would be the same key, which is not what an id means.
+    -- Ids are machine-made ("street:<id>|<postcode>", "municipality:<nis>",
+    -- "address:BE-WAL:<id>"), so ASCII is enough. ascii_bin also means the
+    -- primary key compares byte-exact: under the accent-insensitive server
+    -- collation "Straat:1" and "straat:1" would be the same key, which is not
+    -- what an id means.
     `id`                VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
 
     `doc_type`          ENUM('address', 'street', 'municipality', 'postcode', 'place') NOT NULL,

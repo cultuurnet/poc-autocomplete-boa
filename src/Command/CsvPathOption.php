@@ -20,14 +20,24 @@ use Symfony\Component\Console\Input\InputOption;
  */
 final class CsvPathOption
 {
-    public static function configure(Command $command): void
+    /**
+     * $multiple makes --csv repeatable, for the commands that can read several
+     * exports in one run. It changes the shape of the option value, so it is a
+     * per-command decision rather than a global one: `health` reports on a
+     * single file and `import-places` loads a single export, while `import`
+     * takes the three regional address files together.
+     */
+    public static function configure(Command $command, bool $multiple = false): void
     {
         $command->addOption(
             'csv',
             'f',
-            InputOption::VALUE_REQUIRED,
-            'Path to the address CSV. Required unless CSV_PATH is set; relative paths resolve '
-                . 'against the working directory, which is /app in the container',
+            $multiple ? InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY : InputOption::VALUE_REQUIRED,
+            $multiple
+                ? 'Path to an address CSV; repeat for several files. Required unless CSV_PATH is set; '
+                    . 'relative paths resolve against the working directory, which is /app in the container'
+                : 'Path to the address CSV. Required unless CSV_PATH is set; relative paths resolve '
+                    . 'against the working directory, which is /app in the container',
         );
     }
 
@@ -116,14 +126,40 @@ final class CsvPathOption
      */
     public static function resolveOptional(InputInterface $input, Config $config): ?string
     {
-        $csv = $input->getOption('csv');
+        return self::resolveMany($input, $config)[0] ?? null;
+    }
 
-        if (!is_string($csv) || $csv === '') {
-            return $config->csvPath;
+    /**
+     * Every path named on the command line, in the order they were given, or
+     * the single CSV_PATH fallback when none were.
+     *
+     * Order is preserved rather than sorted because it is the order the files
+     * are imported in, and with --workers that is also the order they are
+     * handed to workers. Duplicates are dropped: importing the same file twice
+     * in one run costs a full CSV pass and, since every document upserts on its
+     * own id, changes nothing.
+     *
+     * @return list<string>
+     */
+    public static function resolveMany(InputInterface $input, Config $config): array
+    {
+        /** @var list<string> $given */
+        $given = array_values(array_filter(
+            array_map(strval(...), (array) $input->getOption('csv')),
+            static fn (string $path): bool => $path !== '',
+        ));
+
+        if ($given === []) {
+            return $config->csvPath === null ? [] : [$config->csvPath];
         }
 
-        $resolved = realpath($csv);
+        $paths = [];
 
-        return $resolved === false ? $csv : $resolved;
+        foreach ($given as $path) {
+            $resolved = realpath($path);
+            $paths[] = $resolved === false ? $path : $resolved;
+        }
+
+        return array_values(array_unique($paths));
     }
 }

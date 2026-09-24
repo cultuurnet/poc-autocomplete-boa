@@ -4,14 +4,24 @@ DC := docker compose
 #   make import ARGS="--limit=100000"
 ARGS ?=
 
-# Path to the CSV, forwarded as --csv. Required by the import targets -- there is
-# no default filename. Paths resolve inside the container, where the project root
-# is mounted at /app:
+# Path(s) to the CSV, forwarded as --csv. Required by the import targets -- there
+# is no default filename. Paths resolve inside the container, where the project
+# root is mounted at /app:
 #   make import CSV=openaddress-bevlg.csv
 #   make import-places CSV=export_places_udb.csv
 #   make import CSV=data/brussels.csv
+#
+# The address register ships one file per region, so the address targets take a
+# space-separated list and turn it into a repeated --csv. A full corpus is:
+#   make import-addresses CSV="openaddress-bevlg.csv openaddress-bewal.csv openaddress-bebru.csv"
 CSV ?=
-CSV_ARG := $(if $(CSV),--csv=$(CSV),)
+CSV_ARG := $(foreach f,$(CSV),--csv=$(f))
+
+# How many files to import in parallel, one child process per file. Capped by
+# the number of files given, so WORKERS=2 on a single CSV still runs in-process:
+#   make append CSV="openaddress-bewal.csv openaddress-bebru.csv" WORKERS=2
+WORKERS ?= 1
+WORKERS_ARG := --workers=$(WORKERS)
 
 # The place export, for `make reset`. Optional: without it reset loads only the
 # address register, which is what it always did.
@@ -21,8 +31,9 @@ PLACES ?=
 # by then you have already waited for docker compose exec to start php.
 require-csv:
 	@test -n "$(CSV)" || { \
-		echo "CSV is not set. Name the file to import, e.g."; \
+		echo "CSV is not set. Name the file(s) to import, e.g."; \
 		echo "  make $(MAKECMDGOALS) CSV=openaddress-bevlg.csv"; \
+		echo "  make $(MAKECMDGOALS) CSV=\"openaddress-bewal.csv openaddress-bebru.csv\" WORKERS=2"; \
 		echo "Paths are relative to the project root (mounted at /app)."; \
 		exit 1; \
 	}
@@ -30,8 +41,8 @@ require-csv:
 .DEFAULT_GOAL := help
 
 .PHONY: help build up down destroy install require-csv import import-mysql \
-        import-es import-addresses import-places benchmark health logs shell \
-        mysql-cli reset
+        import-es import-addresses import-places append append-addresses \
+        benchmark health logs shell mysql-cli reset
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "\033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -54,17 +65,23 @@ destroy: ## Stop the stack AND delete the volumes -- this wipes all imported dat
 install: ## composer install inside the php container
 	$(DC) exec php composer install
 
-import: require-csv ## Import into both engines (needs CSV=path; ARGS="--limit=100000" to shorten)
-	$(DC) exec php php bin/console import --engine=all --recreate $(CSV_ARG) $(ARGS)
+import: require-csv ## Replace the address documents with CSV (needs CSV=paths; ARGS="--limit=100000" to shorten)
+	$(DC) exec php php bin/console import --engine=all --recreate $(CSV_ARG) $(WORKERS_ARG) $(ARGS)
 
-import-mysql: require-csv ## Import into MySQL only (needs CSV=path)
-	$(DC) exec php php bin/console import --engine=mysql --recreate $(CSV_ARG) $(ARGS)
+import-mysql: require-csv ## Replace the address documents in MySQL only (needs CSV=paths)
+	$(DC) exec php php bin/console import --engine=mysql --recreate $(CSV_ARG) $(WORKERS_ARG) $(ARGS)
 
-import-es: require-csv ## Import into Elasticsearch only (needs CSV=path)
-	$(DC) exec php php bin/console import --engine=elasticsearch --recreate $(CSV_ARG) $(ARGS)
+import-es: require-csv ## Replace the address documents in Elasticsearch only (needs CSV=paths)
+	$(DC) exec php php bin/console import --engine=elasticsearch --recreate $(CSV_ARG) $(WORKERS_ARG) $(ARGS)
 
-import-addresses: require-csv ## Import down to house-number level, 4.2M docs (needs CSV=path)
-	$(DC) exec php php bin/console import --engine=all --level=all --recreate $(CSV_ARG) $(ARGS)
+import-addresses: require-csv ## Replace them down to house-number level, 6.6M docs (needs CSV=paths)
+	$(DC) exec php php bin/console import --engine=all --level=all --recreate $(CSV_ARG) $(WORKERS_ARG) $(ARGS)
+
+append: require-csv ## Add CSV to what is already indexed, deleting nothing (needs CSV=paths)
+	$(DC) exec php php bin/console import --engine=all $(CSV_ARG) $(WORKERS_ARG) $(ARGS)
+
+append-addresses: require-csv ## Add CSV down to house-number level, deleting nothing (needs CSV=paths)
+	$(DC) exec php php bin/console import --engine=all --level=all $(CSV_ARG) $(WORKERS_ARG) $(ARGS)
 
 import-places: require-csv ## Import the UiTdatabank place export, ~63k docs (needs CSV=path)
 	$(DC) exec php php bin/console import-places --engine=all --recreate $(CSV_ARG) $(ARGS)
@@ -84,9 +101,9 @@ shell: ## Open a bash shell in the php container
 mysql-cli: ## Open a mysql client on the autocomplete database
 	$(DC) exec mysql mysql -uautocomplete -pautocomplete autocomplete
 
-reset: require-csv ## Clean rebuild: destroy volumes, start fresh, install and import (needs CSV=path; PLACES=path to also load places)
+reset: require-csv ## Clean rebuild: destroy volumes, start fresh, install and import (needs CSV=paths; PLACES=path to also load places)
 	$(MAKE) destroy
 	$(MAKE) up
 	$(MAKE) install
-	$(MAKE) import CSV="$(CSV)" ARGS="$(ARGS)"
+	$(MAKE) import CSV="$(CSV)" WORKERS="$(WORKERS)" ARGS="$(ARGS)"
 	@test -z "$(PLACES)" || $(MAKE) import-places CSV="$(PLACES)"
