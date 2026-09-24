@@ -185,12 +185,9 @@ final class PlaceDocumentSource implements DocumentSourceInterface
             type: SuggestionType::Place,
             // "Yper Museum (Grote Markt 34, 8900 Ieper)". The parenthesised half
             // is built by the same helper the address documents use, so the two
-            // spell the same address the same way.
-            label: sprintf(
-                '%s (%s)',
-                $name,
-                NameFormatter::addressLine($street, $postcode, $postName, $municipality),
-            ),
+            // spell the same address the same way - and is dropped where this
+            // export's hand-typed names have already said it.
+            label: NameFormatter::placeLabel($name, $street, $postcode, $postName, $municipality),
             placeName: $name,
             streetName: $street === '' ? null : $street,
             // The export gives one free-text street line ("Lakenhalle - Grote
