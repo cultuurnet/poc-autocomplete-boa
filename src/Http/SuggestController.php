@@ -8,7 +8,7 @@ use App\Container;
 use App\Model\SuggestionType;
 use App\Model\SuggestQuery;
 use App\Model\SuggestResult;
-use App\Suggest\ElasticsearchSuggester;
+use App\Suggest\AbstractElasticsearchSuggester;
 use App\Suggest\SuggesterInterface;
 use Throwable;
 
@@ -163,7 +163,7 @@ final class SuggestController
             // asked, and the answer is several times the size of the hit, so it
             // stays off unless the caller says otherwise. Note this also makes
             // the request more expensive to serve: never set it while measuring.
-            if ($explain && $suggester instanceof ElasticsearchSuggester) {
+            if ($explain && $suggester instanceof AbstractElasticsearchSuggester) {
                 $suggester->explain = true;
             }
 
