@@ -518,6 +518,116 @@ MySQL was never doing this properly either. Its boolean query for `kerkstraat 12
 `fuzzy_prefix` fallback. It gets the right answer by luck, not by design, which is why the
 Elasticsearch fix does not mirror it.
 
+**A typed house number was matching the postcode** — *done, and the most expensive defect
+found so far.* The sequel to the fix above, and it only exists *because* of it: once
+`HOUSE_NUMBERS_INDEXED=1` puts the number back in the gate, the number is gated as a
+**prefix**, because it is the trailing token and the trailing token is what the user is still
+typing. But `SuggestionDocument::searchText()` folds the street, the house number, the
+postcode and the municipality into **one string**, so a prefix does not know which of those
+it landed on. Every Belgian postcode is four digits, so every house number of one to three
+digits is a prefix of one:
+
+```
+"anspachlaan 100"  ->  gate term "100"  ->  edge n-grams of "1000"  =  1, 10, 100, 1000
+```
+
+That is most house numbers in the country. The gate — the one stage nothing downstream can
+undo — turned the most selective token in the query into the least selective, and then
+`postcodeClauses()` paid the wrongly-admitted documents a `BOOST_POSTCODE_PARTIAL` of 3.0 for
+a postcode the user never typed:
+
+| query | candidates before | of those, at the number typed | candidates after |
+|---|---|---|---|
+| `kerkstraat 90` | 885 | **0** | 46 |
+| `meir 20` | 224 | **0** | 5 |
+| `anspachlaan 100` | 24 | **0** | 24 *(via the new second pass)* |
+| `goorbaan 22` | 45 | **0** | 45 *(via the new second pass)* |
+
+`kerkstraat 90` is the clearest case: 46 documents in Flanders stand at Kerkstraat 90 and
+**not one of them was reachable**. The 885 that answered instead were places in 9050
+Gentbrugge, 9060 Zelzate, 9080 Zaffelare and 9000 Gent — every postcode beginning `90` — and
+because `Place` sorts in `rank_tier` 1 and `Address` in tier 2, the places filled the top ten
+before an address could be considered. All four query methods returned the same 885, and
+MySQL the same class of defect through `+90*` in its boolean query — identical counts across
+methods is the tell that this lived in the shared layer and not in any one method's gate.
+(`es-completion` was never affected and is no consolation: it answers none of these queries
+at all, because the FST only matches a prefix of a whole input.)
+
+The fix is the shape the user reporting it proposed, and it is query-side only — **no
+reindex**:
+
+- **A number is read as a postcode only when it is the whole query.** A bare `22` really is
+  someone typing a postcode, and there it keeps its prefix reading (`22` → 2200 Herentals,
+  2220 Heist-op-den-Berg, …). A number standing next to a name is a house number by
+  construction, so it is gated as a **whole word** and gets no partial-postcode boost.
+  `SuggestQuery::isBareNumeric()` is the whole distinction.
+- **A four-digit postcode still matches exactly.** `anspachlaan 1000` gates on `1000` as a
+  word, which is what `postcode` documents and every document in 1000 Brussel carry.
+
+That alone fixes recall but leaves a new question: what should answer a number that is *not*
+on the street typed? Before the fix the fuzzy fallback caught it, and it caught it badly —
+fuzziness over digits is not a typo model but a random number generator (`100` is one edit
+from 110, 200, 180 *and* 10), and on the incumbent's n-grammed field it reaches every `100x`
+postcode as well. So the fallback is now a **three-step ladder**, and the order is the point:
+
+| pass | gate | answers |
+|---|---|---|
+| `strict` | every token, trailing one as a prefix | the common case |
+| `no_number` | every *name* token exactly, number demoted to ranking | a number not on that street |
+| `fuzzy` | fuzziness itself, numbers dropped | a misspelt street |
+
+The number is given up before the name because the number is exact evidence and the name is
+not. `goorbaan 22` (no number 22 on the Goorbaan) now answers with *Goorbaan, 2230 Herselt*
+and the numbers it does have; before the ladder its fuzzy pass led with two places on the
+*Goormansdijk*, which an n-grammed field is loose enough to reach from `goorbaan`. Fuzziness
+has to come last or it buries the street the user actually typed.
+
+MySQL got the same `no_number` pass, and two smaller corrections that only became visible
+once its gate was exact. Numbers are no longer eligible as its `fuzzyToken()` target — in
+`ab 1000` the longest token is the postcode, so the fuzzy pass was relaxing the one token
+that was certainly correct. And its fuzzy pass **tops up a short list** rather than rescuing
+an empty one, which is fine while the gate is loose and wrong the moment it is exact: there
+are legitimately only two `Kerkstraat 12` in Gent, and topping those two up to ten dragged in
+a hundred places that ignore the number and that MySQL's ranking puts above them. The top-up
+is now skipped when a house number matched exactly; non-numeric queries keep it untouched.
+
+**What it cost.** Every ES method's golden-set MRR went up and every method got faster,
+because a gate that admits 885 documents instead of 46 has to score 885 documents. Measured
+on the **address-level** index (37 golden entries, 178-query set, 2 iterations) — not
+comparable with the 30-entry street-level figures quoted earlier in this section:
+
+| method | MRR before | MRR after | hit@10 | p50 before | p50 after |
+|---|---|---|---|---|---|
+| `elasticsearch` | 0.510 | **0.541** | 26 → 28 | 25.7 ms | 19.4 ms |
+| `es-prefixes` | 0.537 | **0.555** | 27 → 29 | 12.2 ms | 9.2 ms |
+| `es-sayt` | 0.537 | **0.555** | 27 → 29 | 17.1 ms | 13.1 ms |
+| `es-bool-prefix` | 0.537 | **0.555** | 27 → 29 | 7.0 ms | 5.3 ms |
+| `es-completion` | 0.257 | 0.257 | 10 → 10 | 3.2 ms | 2.2 ms |
+| `mysql` | 0.535 | 0.513 | 30 → 27 | 1236 ms | 1162 ms |
+
+MySQL's drop is **three stale golden expectations, not a regression.** All three
+(`goorbaan 59`, `goorbaan 59 2230 herselt`, `veldstraat 10 9000 gent`) expect the *street*
+document, and say why: *"No street document carries a number, so the only right answer is the
+street itself."* That was true when the entries were written against a street-level index. On
+the address-level index it is not: both engines now return exactly **one** document for
+`goorbaan 59` — `address:200001`, *Goorbaan 59, 2230 Herselt* — which is the better answer
+being scored as a miss. `benchmark/golden.json` needs a second set of expectations for
+address level before its numbers mean anything on this corpus; it has deliberately not been
+edited to flatter this change.
+
+Two things the same report asked for that the **corpus** cannot give, and no amount of query
+tuning will:
+
+- *Ancienne Belgique* is at **Anspachlaan 110**, not 100. `anspachlaan 110` already answered
+  correctly before this fix and still does; `anspachlaan 100` now answers through the
+  `no_number` pass, with Ancienne Belgique third.
+- `anspachlaan 1000` cannot answer with the *street* `Anspachlaan, 1000 Brussel`, because
+  **Brussels has no street or address documents at all**. `openaddress-bevlg.csv` is
+  Flanders; of the 3,904 documents with a `10xx` postcode, 3,904 are UiTdatabank places and
+  none is a street. The `Anspachlaan (Anspachlaan 0, 1000 Brussel)` that does appear is a
+  *place* named after the street. Loading the Brussels and Walloon address registers is the
+  only fix, and it is worth knowing before the next report of this shape arrives.
+
 **`minimum_should_match` on the gate** (`"2<-1"`, or a percentage) instead of the hard
 `operator: and`. Lowers the zero-result rate on three-token queries, and with it how often the
 fuzzy second pass has to fire at all.

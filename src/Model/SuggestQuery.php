@@ -23,6 +23,8 @@ final class SuggestQuery
 
     private readonly bool $typingLocative;
 
+    private readonly bool $bareNumeric;
+
     /**
      * @param list<SuggestionType> $types document types to search
      */
@@ -79,8 +81,31 @@ final class SuggestQuery
 
         $this->locative = $locative;
         $this->detail = $detail;
+        $this->bareNumeric = $this->tokens !== [] && array_reduce(
+            $this->tokens,
+            static fn (bool $carry, string $t): bool => $carry && Normalizer::isNumericToken($t),
+            true,
+        );
+
+        // Two conditions, and the second one is the whole point of this class
+        // knowing what a number looks like.
+        //
+        // The trailing token is normally a prefix, because it is the one the
+        // user is still typing. A trailing *number* is the exception, because
+        // the haystack it would be prefix-matched against does not separate
+        // house numbers from postcodes - searchText() folds street, number,
+        // postcode and municipality into one string - so "kerkstraat 90"
+        // prefix-matches the 9050 of Gentbrugge, the 9060 of Zelzate and the
+        // 9080 of Zaffelare, and 885 documents enter a gate that 46 documents
+        // should have passed. The number is the most selective thing the user
+        // typed and prefixing it turns it into the least selective.
+        //
+        // Unless it is all they typed. A bare "90" really is a postcode being
+        // typed - there is no street to attach a house number to - and there
+        // the prefix reading is the only one that means anything.
         $this->typingLocative = $this->tokens !== []
-            && !in_array(array_key_last($this->tokens), $detailIndices, true);
+            && !in_array(array_key_last($this->tokens), $detailIndices, true)
+            && ($this->bareNumeric || !Normalizer::isNumericToken($this->lastToken()));
     }
 
     /**
@@ -152,6 +177,54 @@ final class SuggestQuery
     public function detailTokens(): array
     {
         return $this->detail;
+    }
+
+    /**
+     * Whether the query is nothing but digits ("90", "2230", "12a").
+     *
+     * The one case where a number is read as a postcode being typed rather
+     * than as a house number: with no street or municipality in the query
+     * there is nothing for a house number to be a number *of*.
+     */
+    public function isBareNumeric(): bool
+    {
+        return $this->bareNumeric;
+    }
+
+    /**
+     * The numbers that should rank a document without gating it.
+     *
+     * detailTokens() only holds these on a street-level index; at address
+     * level the number gates instead, and then this is what still tells
+     * number 90 from number 9050 inside the candidate set - and what carries
+     * the fuzzy fallback, where the number is dropped from the gate so that a
+     * mistyped *street* can still be recovered.
+     *
+     * Postcodes are excluded: postcodeClauses() already scores them against
+     * the postcode field, which is the field that actually means postcode,
+     * and scoring them here as well would count the same evidence twice.
+     *
+     * @return list<string>
+     */
+    public function numberTokens(): array
+    {
+        $numbers = [];
+        $seen = [];
+
+        foreach ($this->tokens as $token) {
+            // Appended to a real list, never collected as array keys: PHP turns
+            // the key "90" back into the integer 90, and a caller that types
+            // its parameters would then be handed an int where it declared a
+            // list<string>. The seen-set lives beside the list for that reason.
+            if (isset($seen[$token]) || !Normalizer::isNumericToken($token) || Normalizer::isPostcodeToken($token)) {
+                continue;
+            }
+
+            $seen[$token] = true;
+            $numbers[] = $token;
+        }
+
+        return $numbers;
     }
 
     /**

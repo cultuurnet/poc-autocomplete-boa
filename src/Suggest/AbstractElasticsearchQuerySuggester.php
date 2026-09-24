@@ -114,6 +114,18 @@ abstract class AbstractElasticsearchQuerySuggester extends AbstractElasticsearch
      */
     protected const NAME_MAX_EXPANSIONS = 20;
 
+    /** Every token required, the trailing one as a prefix. The common path. */
+    protected const PASS_STRICT = 'strict';
+
+    /**
+     * Every *name* token required, the house number demoted to a ranking
+     * signal. What answers a number that does not exist on the street typed.
+     */
+    protected const PASS_NO_NUMBER = 'no_number';
+
+    /** Fuzziness itself is the gate. What answers a typo. */
+    protected const PASS_FUZZY = 'fuzzy';
+
     final public function suggest(SuggestQuery $query): SuggestResult
     {
         $engine = $this->name();
@@ -124,25 +136,45 @@ abstract class AbstractElasticsearchQuerySuggester extends AbstractElasticsearch
             return new SuggestResult($engine, [], 0.0, 0, ['skipped' => 'empty query']);
         }
 
-        $body = $this->buildBody($query, fuzzyFallback: false);
-
-        $started = hrtime(true);
-        $response = $this->client->search(['index' => $this->index, 'body' => $body])->asArray();
-        $elapsedMs = (hrtime(true) - $started) / 1e6;
-
-        $engineTookMs = (int) ($response['took'] ?? 0);
-        $passes = 1;
-        $usedFallback = false;
-
-        // The strict gate is unforgiving by design, which means a single typo
-        // produces zero results rather than a slightly worse list. Adding the
-        // fuzzy clause as a `should` in the first pass cannot fix that - a
+        // The strict gate is unforgiving by design, which means one wrong token
+        // produces zero results rather than a slightly worse list. Adding a
+        // looser clause as a `should` in the first pass cannot fix that - a
         // `should` can only reorder documents the `must` already admitted - so
-        // recovery has to be a second query where fuzziness *is* the gate.
-        // Paying for it only on an empty result set keeps the common path at one
-        // round trip.
-        if ($query->fuzzy && $this->hitCount($response) === 0) {
-            $body = $this->buildBody($query, fuzzyFallback: true);
+        // every recovery has to be its own query. They run only on an empty
+        // result set, which keeps the common path at one round trip.
+        //
+        // Two of them, because a query can fail for two different reasons and
+        // they want opposite treatment:
+        //
+        //   "goorbaan 22"  the street is right, the number is not on it
+        //   "gorbaan 22"   the number may be right, the street is misspelt
+        //
+        // The number is exact evidence and the name is not, so the number is
+        // given up first: drop it from the gate, keep it in the ranking, and
+        // "goorbaan 22" answers with Goorbaan and the numbers it does have.
+        // Only when the name itself finds nothing does fuzziness get a turn -
+        // and fuzziness has to come last, because an n-grammed field is loose
+        // enough to reach Goormansdijk from Goorbaan and would happily bury the
+        // street the user actually typed.
+        $ladder = [self::PASS_STRICT];
+
+        if ($query->numberTokens() !== [] && !$query->isBareNumeric()) {
+            $ladder[] = self::PASS_NO_NUMBER;
+        }
+
+        if ($query->fuzzy) {
+            $ladder[] = self::PASS_FUZZY;
+        }
+
+        $elapsedMs = 0.0;
+        $engineTookMs = 0;
+        $passes = 0;
+        $usedPass = self::PASS_STRICT;
+        $body = [];
+        $response = [];
+
+        foreach ($ladder as $pass) {
+            $body = $this->buildBody($query, $pass);
 
             $started = hrtime(true);
             $response = $this->client->search(['index' => $this->index, 'body' => $body])->asArray();
@@ -150,7 +182,11 @@ abstract class AbstractElasticsearchQuerySuggester extends AbstractElasticsearch
 
             $engineTookMs += (int) ($response['took'] ?? 0);
             ++$passes;
-            $usedFallback = true;
+            $usedPass = $pass;
+
+            if ($this->hitCount($response) > 0) {
+                break;
+            }
         }
 
         $suggestions = $this->toSuggestions($response);
@@ -173,7 +209,8 @@ abstract class AbstractElasticsearchQuerySuggester extends AbstractElasticsearch
                 'client_took_ms' => round($elapsedMs, 3),
                 'overhead_ms' => round($elapsedMs - $engineTookMs, 3),
                 'passes' => $passes,
-                'fuzzy_fallback' => $usedFallback,
+                'pass' => $usedPass,
+                'fuzzy_fallback' => $usedPass === self::PASS_FUZZY,
                 'total_relation' => (string) ($response['hits']['total']['relation'] ?? 'eq'),
                 'track_total_hits' => self::TRACK_TOTAL_HITS,
                 'max_score' => $response['hits']['max_score'] ?? null,
@@ -234,20 +271,59 @@ abstract class AbstractElasticsearchQuerySuggester extends AbstractElasticsearch
      *
      * @return list<array<string, mixed>>
      */
-    final protected function gateMust(SuggestQuery $query, bool $fuzzyFallback): array
+    final protected function gateMust(SuggestQuery $query, string $pass): array
     {
+        // The no-number pass keeps the strict gate and simply stops requiring
+        // the number. Nothing else changes, so a street that exists is still
+        // matched exactly rather than approximately, and the number still ranks
+        // through addressDetailClauses().
+        if ($pass === self::PASS_NO_NUMBER) {
+            $wholeWords = self::withoutNumbers($query->locativeTokens());
+
+            // isTypingLocative() is already false whenever a number is the
+            // trailing token, so the prefix here can only ever be a name.
+            $prefix = $query->isTypingLocative() ? array_pop($wholeWords) : null;
+
+            return $this->gateClauses($wholeWords, $prefix);
+        }
+
         // The fallback pass makes fuzziness itself the gate, and edit distance
         // over whole words is the whole point of it, so the split does not
         // apply - but the locative filter still does, or a house number would
         // re-gate the very query the fallback exists to rescue.
-        if ($fuzzyFallback) {
-            return [$this->fuzzyGateClause(implode(' ', $query->locativeTokens()))];
+        if ($pass === self::PASS_FUZZY) {
+            // Numbers are dropped rather than fuzzified. Edit distance over
+            // digits is not a typo model, it is a random number generator: "100"
+            // is one edit from 110, 200, 180 and 10, and on the incumbent's
+            // n-grammed field it also reaches every 100x postcode. So the
+            // fallback recovers a mistyped *street* and lets numberTokens()
+            // rank the number through addressDetailClauses(), which is the only
+            // place a number can be wrong without costing recall.
+            return [$this->fuzzyGateClause(implode(' ', self::withoutNumbers($query->locativeTokens())))];
         }
 
         $wholeWords = $query->locativeTokens();
         $prefix = $query->isTypingLocative() ? array_pop($wholeWords) : null;
 
         return $this->gateClauses($wholeWords, $prefix);
+    }
+
+    /**
+     * The tokens with every number removed - unless that is all of them, where
+     * removing them would leave an empty gate matching the whole index.
+     *
+     * @param list<string> $tokens
+     *
+     * @return list<string>
+     */
+    private static function withoutNumbers(array $tokens): array
+    {
+        $named = array_values(array_filter(
+            $tokens,
+            static fn (string $t): bool => !Normalizer::isNumericToken($t),
+        ));
+
+        return $named === [] ? $tokens : $named;
     }
 
     /**
@@ -277,7 +353,7 @@ abstract class AbstractElasticsearchQuerySuggester extends AbstractElasticsearch
      *
      * @return array<string, mixed>
      */
-    final protected function buildBody(SuggestQuery $query, bool $fuzzyFallback): array
+    final protected function buildBody(SuggestQuery $query, string $pass): array
     {
         $text = $query->normalized();
 
@@ -313,8 +389,8 @@ abstract class AbstractElasticsearchQuerySuggester extends AbstractElasticsearch
                     'query' => [
                         'bool' => [
                             'filter' => $this->docTypeFilter($query->typeValues()),
-                            'must' => $this->gateMust($query, $fuzzyFallback),
-                            'should' => $this->precisionClauses($query, $text, $fuzzyFallback),
+                            'must' => $this->gateMust($query, $pass),
+                            'should' => $this->precisionClauses($query, $text, $pass),
                             // Explicit: `should` is pure ranking here. With a `must`
                             // present ES defaults to this anyway, but leaving it
                             // implicit is how someone later "simplifies" the must
@@ -341,7 +417,7 @@ abstract class AbstractElasticsearchQuerySuggester extends AbstractElasticsearch
      *
      * @return list<array<string, mixed>>
      */
-    final protected function precisionClauses(SuggestQuery $query, string $text, bool $fuzzyFallback): array
+    final protected function precisionClauses(SuggestQuery $query, string $text, string $pass): array
     {
         // The whole name, typed out. A term lookup, so it only fires on an
         // exact match of the complete folded value - primary_name.keyword
@@ -409,7 +485,7 @@ abstract class AbstractElasticsearchQuerySuggester extends AbstractElasticsearch
 
         // In the fallback pass fuzziness is already the gate, so repeating it
         // here would just double-count the same evidence.
-        if ($query->fuzzy && !$fuzzyFallback) {
+        if ($query->fuzzy && $pass !== self::PASS_FUZZY) {
             // Honest note: because the gate above is strict, this clause can only
             // ever re-rank documents that already matched exactly. It is kept
             // because it is nearly free on an already-small candidate set and it
@@ -446,8 +522,20 @@ abstract class AbstractElasticsearchQuerySuggester extends AbstractElasticsearch
     final protected function addressDetailClauses(SuggestQuery $query): array
     {
         $clauses = [];
+        $seen = [];
 
-        foreach ($query->detailTokens() as $token) {
+        // detailTokens() is empty at address level - the number gates instead
+        // of ranking - but the ranking signal is still wanted there: it is what
+        // separates number 9 from number 90 inside the candidates the gate
+        // admitted, and what pulls the right number back to the top of a fuzzy
+        // fallback that had to drop it from the gate to work at all.
+        foreach ([...$query->detailTokens(), ...$query->numberTokens()] as $token) {
+            if (isset($seen[$token])) {
+                continue;
+            }
+
+            $seen[$token] = true;
+
             // The marker word itself is not in any haystack - SuggestionDocument
             // never puts box_number into search_text - so a clause on it could
             // only ever score zero.
@@ -529,10 +617,21 @@ abstract class AbstractElasticsearchQuerySuggester extends AbstractElasticsearch
             }
 
             // A short numeric token is ambiguous - "22" is as likely a house
-            // number as the start of "2230". Only the token still being typed
-            // gets the postcode reading, because a *finished* short number in the
-            // middle of a query is almost always a house number.
-            if ($token === $lastToken && preg_match('/^[1-9][0-9]{0,2}$/', $token) === 1) {
+            // number as the start of "2230" - and two things have to be true
+            // before it is read as a postcode being typed.
+            //
+            // It has to be the token still being typed, because a *finished*
+            // short number in the middle of a query is almost always a house
+            // number. And the query has to be nothing else, because a number
+            // standing next to a street name is a house number by construction:
+            // on "anspachlaan 100" this clause used to hand every place in 1000
+            // Brussel a 3.0 boost for a postcode the user never typed, which is
+            // how "Anspachlaan 28" came to answer a search for number 100.
+            if (
+                $query->isBareNumeric()
+                && $token === $lastToken
+                && preg_match('/^[1-9][0-9]{0,2}$/', $token) === 1
+            ) {
                 $clauses[] = [
                     // Against postcode.text, whose edge n-grams turn this into a
                     // single term lookup instead of a prefix scan.

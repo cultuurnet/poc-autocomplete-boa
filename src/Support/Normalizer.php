@@ -110,6 +110,22 @@ final class Normalizer
     }
 
     /**
+     * True when the token opens with a digit: a postcode, a house number, or
+     * either of those still half typed ("9", "90", "12a", "3bis").
+     *
+     * Deliberately broader than isPostcodeToken() and isHouseNumberToken()
+     * together, and deliberately not length-bounded: the question it answers is
+     * "did the user start typing a number here", which is what decides whether
+     * a token may be prefix-matched against a haystack that mixes house numbers
+     * and postcodes into one string. A four-digit answer to that question is
+     * not a different answer from a two-digit one.
+     */
+    public static function isNumericToken(string $token): bool
+    {
+        return preg_match('/^[0-9]+[a-z]{0,3}$/', $token) === 1;
+    }
+
+    /**
      * True when the token looks like a house number ("59", "12a", "3bis").
      */
     public static function isHouseNumberToken(string $token): bool

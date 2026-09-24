@@ -129,7 +129,8 @@ final class MysqlSuggester implements SuggesterInterface
         $types = $query->typeValues();
         $terms = $this->scoringTerms($tokens);
 
-        $booleanQuery = $this->booleanQuery($tokens);
+        $bareNumeric = $query->isBareNumeric();
+        $booleanQuery = $this->booleanQuery($tokens, $bareNumeric);
         $shortTokens = $this->shortTokens($tokens);
         $namePrefix = implode(' ', $tokens) . '%';
 
@@ -140,7 +141,7 @@ final class MysqlSuggester implements SuggesterInterface
         $engineNs = 0;
 
         if ($booleanQuery !== '') {
-            [$sql, $params] = $this->fulltextPassSql($terms, $booleanQuery, $shortTokens, $types, $pool);
+            [$sql, $params] = $this->fulltextPassSql($terms, $booleanQuery, $shortTokens, $bareNumeric, $types, $pool);
             $engineNs += $this->runPass('fulltext', $sql, $params, $terms, $candidates, $passDebug);
         }
 
@@ -158,15 +159,64 @@ final class MysqlSuggester implements SuggesterInterface
             $engineNs += $this->runPass('name_prefix', $sql, $params, $terms, $candidates, $passDebug);
         }
 
+        // Same ladder as the Elasticsearch side, and for the same reason: a
+        // house number that is not on the street typed should answer with the
+        // street, not with whatever the fuzzy pass can reach. Dropping the
+        // number and keeping every name token exact is the honest degradation,
+        // and it has to come before the fuzzy pass or a mistyped street would
+        // never be distinguishable from a number that simply does not exist.
+        $numbers = $query->numberTokens();
+
+        // Only on an empty result set, never merely a short one - unlike the
+        // fuzzy pass below, which tops up. Dropping the most selective token
+        // the user typed is a change of question, not a top-up: on
+        // "kerkstraat 12 gent" the two exact addresses are a complete answer,
+        // and widening to every Kerkstraat in Gent because there were only two
+        // of them buries them under a hundred places that ignore the number.
+        if ($numbers !== [] && !$bareNumeric && $candidates === []) {
+            $named = array_values(array_filter(
+                $tokens,
+                static fn (string $t): bool => !Normalizer::isNumericToken($t),
+            ));
+
+            if ($named !== []) {
+                $noNumberBoolean = $this->booleanQuery($named, $bareNumeric);
+
+                if ($noNumberBoolean !== '') {
+                    [$sql, $params] = $this->fulltextPassSql(
+                        $terms,
+                        $noNumberBoolean,
+                        $this->shortTokens($named),
+                        $bareNumeric,
+                        $types,
+                        $pool,
+                    );
+                    $engineNs += $this->runPass('no_number', $sql, $params, $terms, $candidates, $passDebug);
+                }
+            }
+        }
+
         $fuzzyDebug = ['enabled' => $query->fuzzy, 'used' => false];
         $rerankNs = 0;
 
-        if ($query->fuzzy && count($candidates) < $limit) {
+        // The fuzzy pass here tops up a short list rather than rescuing an
+        // empty one, which is how MySQL compensates for having no real
+        // edit-distance search. That is fine while the gate is loose, and wrong
+        // the moment it is exact: a query carrying a house number that actually
+        // matched is a *complete* answer, and there are legitimately only two
+        // Kerkstraat 12 in Gent. Topping those two up to ten drags in a hundred
+        // places that ignore the number, and MySQL's ranking puts them above
+        // the two rows the user asked for. Non-numeric queries keep the
+        // top-up untouched.
+        $exactNumberHit = $numbers !== [] && !$bareNumeric && $candidates !== [];
+
+        if ($query->fuzzy && !$exactNumberHit && count($candidates) < $limit) {
             [$engineNs, $rerankNs, $fuzzyDebug] = $this->fuzzyFallback(
                 $tokens,
                 $terms,
                 $types,
                 $prefixTypes,
+                $bareNumeric,
                 $pool,
                 $engineNs,
                 $candidates,
@@ -252,6 +302,7 @@ final class MysqlSuggester implements SuggesterInterface
         array $terms,
         string $booleanQuery,
         array $shortTokens,
+        bool $bareNumeric,
         array $types,
         int $limit,
     ): array {
@@ -264,6 +315,18 @@ final class MysqlSuggester implements SuggesterInterface
         $whereParams = [$booleanQuery];
 
         foreach ($shortTokens as $token) {
+            // A short number in a query that also names something is a house
+            // number, and matching it as a prefix is what let "meir 20" answer
+            // with the whole of 2000 Antwerpen. Padding both sides turns it into
+            // a whole-word test - the same trick the house-number scoring term
+            // below already uses - so "20" stops matching 2000 and 204.
+            if (!$bareNumeric && Normalizer::isNumericToken($token)) {
+                $where[] = "CONCAT(' ', `search_text`, ' ') LIKE ?";
+                $whereParams[] = '% ' . $token . ' %';
+
+                continue;
+            }
+
             // search_text is single-space separated, so "some word starts with
             // ab" is "ab%" at the head or "% ab%" anywhere after it. No index
             // can serve this, but it only ever runs over the rows the fulltext
@@ -426,6 +489,7 @@ final class MysqlSuggester implements SuggesterInterface
         array $terms,
         array $types,
         array $prefixTypes,
+        bool $bareNumeric,
         int $pool,
         int $engineNs,
         array &$candidates,
@@ -448,13 +512,14 @@ final class MysqlSuggester implements SuggesterInterface
 
         // Anchor on every other token exactly; only the suspect one is relaxed.
         $anchors = array_values(array_filter($tokens, static fn (string $t): bool => $t !== $target));
-        $relaxedBoolean = $this->booleanQuery([...$anchors, $relaxed]);
+        $relaxedBoolean = $this->booleanQuery([...$anchors, $relaxed], $bareNumeric);
 
         if ($relaxedBoolean !== '') {
             [$sql, $params] = $this->fulltextPassSql(
                 $terms,
                 $relaxedBoolean,
                 $this->shortTokens($anchors),
+                $bareNumeric,
                 $types,
                 $pool,
             );
@@ -525,6 +590,15 @@ final class MysqlSuggester implements SuggesterInterface
 
         foreach ($tokens as $token) {
             if (strlen($token) <= self::FULLTEXT_MIN_PREFIX) {
+                continue;
+            }
+
+            // Never a number. Relaxing "1000" to "10" and then ranking on edit
+            // distance does not recover a typo, it ranks every postcode in the
+            // country by how close its digits are - and the longest token in
+            // "ab 1000" is the postcode, so without this the fuzzy pass would
+            // relax the one token that was certainly typed correctly.
+            if (Normalizer::isNumericToken($token)) {
                 continue;
             }
 
@@ -915,9 +989,16 @@ final class MysqlSuggester implements SuggesterInterface
      * `+` is what makes boolean mode an AND, the trailing `*` is what makes it
      * type-ahead.
      *
+     * With one exception, which mirrors SuggestQuery::isTypingLocative(): a
+     * number in a query that also names something keeps no `*`. search_text
+     * concatenates the house number and the postcode, so `+90*` matches the
+     * 9050 of Gentbrugge as readily as house number 90 - "kerkstraat 90" kept
+     * 885 rows, of which none stood at number 90. A bare "+90*" with no street
+     * beside it is still a postcode being typed and keeps its star.
+     *
      * @param list<string> $tokens
      */
-    private function booleanQuery(array $tokens): string
+    private function booleanQuery(array $tokens, bool $bareNumeric): string
     {
         $terms = [];
 
@@ -926,7 +1007,9 @@ final class MysqlSuggester implements SuggesterInterface
                 continue; // handled by shortTokenPatterns()
             }
 
-            $terms[] = '+' . $token . '*';
+            $exact = !$bareNumeric && Normalizer::isNumericToken($token);
+
+            $terms[] = '+' . $token . ($exact ? '' : '*');
         }
 
         return implode(' ', $terms);
