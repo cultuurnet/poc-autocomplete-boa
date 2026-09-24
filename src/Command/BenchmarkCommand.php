@@ -653,7 +653,14 @@ final class BenchmarkCommand extends Command
     {
         foreach ($suggestions as $index => $suggestion) {
             foreach ($expectations as $expectation) {
-                $isId = preg_match('/^(address|street|municipality|postcode):/', $expectation) === 1;
+                // `place` belongs in this list even though the id_format note in
+                // golden.json long omitted it: a place is a first-class
+                // document type with its own rank tier, and without the prefix
+                // here a "place:<cdbid>" expectation fell through to the
+                // substring branch and was compared against the label, which
+                // never contains the cdbid - so it could not match anything and
+                // the only way to express a venue was a label fragment.
+                $isId = preg_match('/^(address|street|municipality|postcode|place):/', $expectation) === 1;
 
                 $matched = $isId
                     ? $suggestion->id === $expectation

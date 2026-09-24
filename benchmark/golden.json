@@ -1,17 +1,19 @@
 {
     "_readme": {
         "what": "Curated ground truth for the MySQL vs Elasticsearch autocomplete POC. Each entry is a known-item query: there is one thing the user meant, and the engine either surfaced it or did not.",
-        "derived_from": "openaddress-bevlg.csv. Every id below was read out of the actual file (street_id, postcode, municipality_id / NIS), not invented. If the export is refreshed, re-derive them before trusting the scores.",
+        "derived_from": "openaddress-bevlg.csv, plus -bebru.csv for the Brussels entries (the address ids of the two registers are namespaced differently: \"address:200001\" for Flanders, \"address:BE-BRU:145258\" for Brussels). Every id below was read out of the actual file (street_id, postcode, municipality_id / NIS), not invented. If the export is refreshed, re-derive them before trusting the scores.",
         "id_format": {
             "street": "street:{street_id}|{postcode}",
             "address": "address:{address_id}",
             "municipality": "municipality:{nis_code}",
-            "postcode": "postcode:{postcode}"
+            "postcode": "postcode:{postcode}",
+            "place": "place:{cdbid}"
         },
         "matching_rule": "An expectation that starts with 'street:', 'address:', 'municipality:' or 'postcode:' is compared against the suggestion id, exactly. Anything else is compared case-insensitively as a substring of the suggestion label. Use an id when exactly one document is correct; use a label substring when a whole family of documents would be an acceptable answer.",
         "expect_semantics": "The 'expect' list holds alternatives, not a set to retrieve in full: an entry counts as a hit at k when any expectation matches any of the top k suggestions. MRR uses the rank of the first matching suggestion.",
-        "index_level": "All expectations sit at street / municipality / postcode level, so the set scores correctly against a default `import --level=street` run. Nothing here needs the 4.2M address-level import.",
-        "house_numbers": "The entries carrying a house number or a box reference expect the street document, not an address: a street-level index holds no number, and the split in SuggestQuery exists precisely so that typing one cannot empty the result set. Three of them (\"kerkstraat 12 9000 gent\", \"goorbaan 59 2230 herselr\", \"grote markt 1 2000 antwrepen\") reach an answer only through the fuzzy fallback and returned nothing before 1f324db. Keep at least those three: the set held no query with a number in it at all, which is how that regression survived c93ecc8."
+        "index_level": "The set scores correctly at BOTH index levels, and that is what the paired expectations are for: an entry whose query carries a house number lists the address document first and the street document second, and either counts as a hit. On a default `import --level=street` run no address document exists, so the street expectation is the one that can match; at `--level=all` the address exists and is the better answer, and it is listed first to say so. This used to read \"all expectations sit at street / municipality / postcode level ... nothing here needs the address-level import\", which stopped being true the moment HOUSE_NUMBERS_INDEXED let the number gate the search: the set then scored the *correct* single address as a miss and a house-number fix as a regression.",
+        "folding": "Two entries (\"o.l.v. ten steenstraat\", \"jean d'ardennestraat\") exist only to guard that the index folds text the same way Normalizer folds the query. They are the queries that go to zero results if the strip_punctuation char filter is ever dropped from ElasticsearchMapping as redundant: the standard tokenizer splits on hyphens but keeps \".\" and \"'\" word-internal, so \"O.L.V.\" indexes as one token while the query side sends three. Nothing else in this set carries punctuation inside a word, which is how that would have gone unnoticed.",
+  "house_numbers": "The entries carrying a house number or a box reference expect the address document and the street document as alternatives, because which of the two is right depends on the index and not on the query - see index_level. What they all guard is that typing a number can neither empty the result set nor widen it: a street-level index holds no number, while at address level the number gates the search and a one-to-three-digit number is a prefix of every four-digit postcode (\"kerkstraat 90\" admitted 885 documents, none at number 90, before 77c490e). Three of them (\"kerkstraat 12 9000 gent\", \"goorbaan 59 2230 herselr\", \"grote markt 1 2000 antwrepen\") reach an answer only through the fuzzy fallback and returned nothing before 1f324db. Keep at least those three: the set held no query with a number in it at all, which is how that regression survived c93ecc8."
     },
     "entries": [
         {
@@ -166,38 +168,73 @@
         },
         {
             "query": "goorbaan 59",
-            "expect": ["street:14602|2230"],
-            "note": "A house number on a street that is unique in Flanders. No street document carries a number, so the only right answer is the street itself - the number has to rank, never gate."
+            "expect": ["address:200001", "street:14602|2230"],
+            "note": "A house number on a street that is unique in Flanders. Two right answers, one per index level, and they are alternatives on purpose: a street-level index holds no number so the street is all there is, while an address-level index holds number 59 itself and that is the better answer. Scoring only the street here is what made the house-number gate fix look like a regression."
         },
         {
             "query": "goorbaan 59 2230 herselt",
-            "expect": ["street:14602|2230"],
-            "note": "The full shape a geocoding lookup arrives in: street, number, postcode and municipality, all correct. Still one document, still the street."
+            "expect": ["address:200001", "street:14602|2230"],
+            "note": "The full shape a geocoding lookup arrives in: street, number, postcode and municipality, all correct. At address level both engines narrow this to exactly one document, the address."
         },
         {
             "query": "veldstraat 10 9000 gent",
-            "expect": ["street:71854|9000"],
-            "note": "The same shape in a city where the street name is far from unique. The postcode does the narrowing and the house number must not undo it."
+            "expect": ["address:1506863", "street:71854|9000"],
+            "note": "The same shape in a city where the street name is far from unique. The postcode does the narrowing; the house number must sharpen it at address level and must not empty it at street level."
         },
         {
             "query": "kerkstraat 12 bus 5 gent",
-            "expect": ["street:70662|9050"],
+            "expect": ["address:20305771", "street:70662|9050"],
             "note": "House number plus box reference. \"bus\" is in no haystack at any level - SuggestionDocument::searchText() never writes box_number - so requiring it finds nothing at all."
         },
         {
             "query": "kerkstraat 12 9000 gent",
-            "expect": ["street:70662|9050"],
+            "expect": ["address:20305771", "street:70662|9050"],
             "note": "No Kerkstraat carries postcode 9000, so the strict gate comes back empty and the fuzzy fallback has to answer. Regression guard for 1f324db: that fallback re-required the house number and returned nothing, while the same query without the 12 returned three."
         },
         {
             "query": "goorbaan 59 2230 herselr",
-            "expect": ["street:14602|2230"],
+            "expect": ["address:200001", "street:14602|2230"],
             "note": "A typo in the municipality together with a house number - the combination that reaches the fallback with detail tokens still attached. Zero results before 1f324db."
         },
         {
             "query": "grote markt 1 2000 antwrepen",
-            "expect": ["street:1064|2000"],
+            "expect": ["address:3738064", "street:1064|2000"],
             "note": "The same failure on a transposition rather than a substitution, which is what fuzzy_transpositions exists for. Zero results before 1f324db."
+        },
+        {
+            "query": "anspachlaan",
+            "expect": ["Anspachlaan"],
+            "note": "Brussels at all. Every entry above this block was Flemish, because openaddress-bevlg.csv was the whole corpus and a bare \"anspachlaan\" could only ever answer with a UiTdatabank *place* named after the street. This block exists to keep the Brussels register loaded: drop it and these fail. A label substring rather than street:441|1000 for the reason the \"jean d'ardennestraat\" note gives - places stand on this street and rank_tier puts them above it, so pinning the street id would score a correct, documented ordering as a miss. What is tested here is reachability."
+        },
+        {
+            "query": "anspachlaan 1000",
+            "expect": ["street:441|1000"],
+            "note": "Street plus its own postcode, where the postcode is also a complete four-digit token. The reported expectation, verbatim: typing towards \"Anspachlaan 1000 Brussel\" should lead with the street, not with the venues standing on it. THIS ENTRY CURRENTLY FAILS, deliberately kept: the street ranks 25th, behind 24 places, because rank_tier sorts every place above every street and 421 documents match. That is the product choice in SuggestionType::rankTier() colliding with a real user expectation, not a retrieval bug - the street is found, it is buried. Field collapsing on street_name, or a diversity rescore, is what would fix it; until then this entry is the standing evidence that the reported case is only half solved. This is the one entry in the set that pins street:441|1000 *despite* the label-substring convention the \"anspachlaan\" and \"jean d'ardennestraat\" notes describe, and it does so deliberately: there the ordering is correct and an id would misreport it, here the ordering is the thing being reported as wrong."
+        },
+        {
+            "query": "anspachlaan 100",
+            "expect": ["address:BE-BRU:145258", "street:441|1000"],
+            "note": "The reported bug, and the reason 77c490e exists. \"100\" is a prefix of the postcode 1000, so the edge-n-gram gate admitted all 24 places in 1000 Brussel and none of them stood at number 100 - the top hit was Anspachlaan 28. Number 100 does exist; it was unreachable twice over, first because the number was prefix-matched against the postcode and then because Brussels held no address documents at all."
+        },
+        {
+            "query": "anspachlaan 110",
+            "expect": ["place:787d7420-c06f-4935-b3c5-5cd5a1276796", "address:BE-BRU:154381"],
+            "note": "The address the reporter meant: Ancienne Belgique is at 110, not 100. Both answers are right and the order states the preference - rank_tier puts the venue above the address it stands at, which is the whole reason place has a tier of its own."
+        },
+        {
+            "query": "o.l.v. ten steenstraat",
+            "expect": ["street:36695|3300", "O.L.V. ten Steenstraat"],
+            "note": "Punctuation inside a word, and the rule it guards: the index and the query side have to fold identically. Normalizer turns this into \"o l v ten steenstraat\" on the query side, so the index must hold the same four tokens. It does not get that from the standard tokenizer, which implements Unicode word boundaries and keeps \".\" word-internal (\"O.L.V.\" -> \"o.l.v\"); the strip_punctuation char filter in ElasticsearchMapping is what splits it. Remove that char filter and the gate asks for \"o\" AND \"l\" AND \"v\" against a document that only has \"o.l.v\", and this returns nothing at all. The label alternative is there because any document on this street proves the folding works - the entry is about recall, not about which document wins."
+        },
+        {
+            "query": "jean d'ardennestraat",
+            "expect": ["Jean d'Ardennestraat"],
+            "note": "The same rule for the apostrophe, which is the shape the Normalizer docblock calls out (\"Rue de l'Église\" -> \"rue de l eglise\"). Dutch street names rarely carry one, so this is a Brussels entry. Deliberately a label substring and not an id: a place stands on this street and rank_tier puts it above the street, so pinning the street id would score a correct, documented ordering as a miss - what is being tested is that a name with an apostrophe is reachable at all. Without the char filter the index holds \"d'ardennestraat\" as one token, the query sends \"d\" and \"ardennestraat\", and nothing matches."
+        },
+        {
+            "query": "ancienne belgique",
+            "expect": ["place:787d7420-c06f-4935-b3c5-5cd5a1276796"],
+            "note": "The same venue by name rather than by address, and the first entry in this set to be pinned to a place id - which needed \"place\" adding to the id prefixes in BenchmarkCommand::firstMatchRank(), where it had been missing since places were introduced."
         }
     ]
 }

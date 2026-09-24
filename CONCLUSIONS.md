@@ -19,10 +19,10 @@ evidence.
 
 ## How each engine works
 
-Every method indexes the **same folded text**. `src/Support/Normalizer.php` lowercases, strips
-diacritics and drops punctuation; Elasticsearch reproduces exactly that chain with
-`lowercase` + `asciifolding`. If the two folded differently, the benchmark would be measuring
-preprocessing rather than the engines.
+Every method indexes the **same folded text**, and both engines are handed the same parsed
+query — see [What the code does before the engine sees it](#what-the-code-does-before-the-engine-sees-it).
+If the two sides folded or parsed differently, the benchmark would be measuring preprocessing
+rather than the engines.
 
 ### MySQL
 
@@ -55,18 +55,282 @@ All four *search* methods share, byte for byte: the `doc_type` filter, `size`,
 per-type weights), and the same two-pass fuzzy fallback. Boosts were deliberately **not**
 re-tuned per method: if one ranks worse, that is the finding.
 
-The gate is decomposed once, centrally, so no two methods can disagree about *which* token
-the user is still typing: finished words match whole, the trailing token matches as a prefix,
-and house numbers or box references are handled per
-[`HOUSE_NUMBERS_INDEXED`](README.md#house-numbers-and-the-gate). `es-completion` is the
-exception to all of this and cannot be otherwise — the suggest API takes no query, no filter
+The gate is decomposed once, centrally — see
+[What the code does before the engine sees it](#what-the-code-does-before-the-engine-sees-it)
+— so no two methods can disagree about *which* token the user is still typing, or about what
+to do with a house number. `es-completion` is the exception to all of this and cannot be
+otherwise — the suggest API takes no query, no filter
 and no sort — which is why it is in the comparison as a latency floor rather than as a
 candidate.
 
-### Ordering across document types
+## What the code does before the engine sees it
 
-This is the one thing no method decides by score alone. Results are grouped into **three
-tiers**, and score only decides the order *inside* a tier:
+Elasticsearch is not left to be clever on its own. A large part of what makes the results good
+happens in PHP — once per document at import, once per request at query time — and none of it
+is Elasticsearch-specific: both engines are handed the same folded text and the same parsed
+query, which is what keeps the comparison honest.
+
+**This section is the port list.** When this POC is rebuilt inside a real codebase, these are
+the steps to reproduce, in this order; anything left out has a named symptom, which is written
+next to it. Dropping one of them does not degrade the results gracefully — most of them are
+the difference between "a result" and "no result at all".
+
+**The test cases live in [`benchmark/golden.json`](benchmark/golden.json).** Every rule below
+that can be stated as a known-item query has an entry there — the punctuation folding of step
+1, the house-number gate and the postcode-prefix trap of step 4, the fuzzy rung of step 5 —
+each with a note naming the rule it guards and what breaks without it. Port the steps, then
+run the set against the new implementation: an entry that stops being a hit names the step
+that was dropped. Its `_readme` documents the id format and the matching rule.
+
+### Step 1 — one folding, applied to both sides
+
+`src/Support/Normalizer.php` lowercases, strips diacritics through an explicit map (no
+`ext-intl`, so the output is byte-for-byte predictable across PHP builds), replaces every
+non-alphanumeric run with a separator and collapses whitespace: `Rue de l'Église` becomes
+`rue de l eglise`. The importer stores that folded string on the document; the query side
+folds the typed string with the exact same function.
+
+Elasticsearch has to reproduce that chain, not approximate it
+(`ElasticsearchMapping::settings()`):
+
+| piece | what it is | why it exists |
+|---|---|---|
+| `strip_punctuation` char filter | `pattern_replace` on `[^\p{L}\p{N}]+` → space | Looks redundant next to the `standard` tokenizer; is not, in two places — see below. It matches on `\p{L}\p{N}` and not `[a-z0-9]` because it runs *before* folding and would otherwise eat the accented characters before they can be folded. |
+| `folding` analyzer | char filter → `standard` → `lowercase` + `asciifolding` | The analyser equivalent of `Normalizer::normalize()`. `asciifolding` covers the multi-character expansions (`ß`→`ss`, `æ`→`ae`) too. |
+| `autocomplete_index` analyzer | the same chain plus `edge_ngram` 1–20, `preserve_original` | Index time only. `preserve_original` exists because a token longer than `max_gram` would otherwise only be indexed as its first 20 characters, and typing the whole word would stop matching it — `Kortrijksepoortstraat` is 21. |
+| `folding_keyword` normalizer | the same chain, `trim`, applied to the value as a whole | Folds the whole value into *one* term instead of tokenising it. |
+
+**Why the char filter, when the tokenizer already drops punctuation?** Because it only drops
+it *between* words. The `standard` tokenizer implements Unicode word boundaries, where `'` and
+`.` are word-internal, and a *normalizer* has no tokenizer at all. Measured on the cluster:
+
+| value | ES without the char filter | with it — and what PHP produces |
+|---|---|---|
+| `Sint-Genesius-Rode`, text field | `sint, genesius, rode` | same — the tokenizer needs no help here |
+| `Rue de l'Église` | `rue, de, `**`l'eglise`** | `rue, de, l, eglise` |
+| `O.L.V.-straat` | **`o.l.v`**`, straat` | `o, l, v, straat` |
+| `Sint-Genesius-Rode`, `primary_name.keyword` | **`sint-genesius-rode`** | `sint genesius rode` |
+
+The last row is the one that costs something: the query side sends `sint genesius rode`, so
+without the char filter the exact-name clause below never matches anything. (The obvious
+alternative, the `apostrophe` token filter, is wrong here — it truncates at the apostrophe, so
+`l'eglise` becomes `l` and the street name is lost.)
+
+Two more rules that come with it, and are easy to lose in a port:
+
+- **Index n-grams, search whole words.** Every n-grammed field sets `search_analyzer` back to
+  `folding`. If the query were analysed with the index analyser too, typing `gent` would
+  search for `g`, `ge`, `gen` *and* `gent` — every street starting with `g` matches, and
+  precision collapses while the result list still looks plausible.
+- **`norms: false` on every n-grammed field.** Edge n-grams make the token count a function of
+  the number of *characters*, so BM25 length normalisation would punish long street names for
+  being long rather than for being a worse match. The length signal is kept on the
+  whole-word `.folded` subfields.
+
+The `folding_keyword` normaliser is what makes the single strongest clause in the query
+possible at all: `primary_name.keyword` then holds `sint genesius rode`, byte-for-byte what
+`SuggestQuery::normalized()` sends. Without it the subfield holds `Sint-Genesius-Rode` and the
+exact-name clause (`BOOST_NAME_EXACT`, 12.0 — the highest boost in the file) silently never
+fires.
+
+### Step 2 — one deduplicated haystack per document
+
+`SuggestionDocument::searchText()` folds place name, street, house number, postcode, post
+name, municipality and aliases into a **single deduplicated string**, and that one string is
+what the recall gate reads in both engines (`search_text` in Elasticsearch, the `FULLTEXT`
+column in MySQL).
+
+Deduplication is not cosmetic: a street called Gent in the municipality Gent would otherwise
+repeat a token, and term frequency would reward it for saying the same thing twice.
+
+The catch-all is mapped twice on purpose — the n-grammed parent field for the token still
+being typed, and a whole-word `search_text.folded` subfield for the tokens already finished.
+Type-ahead needs both; gating a *finished* word against the n-grammed parent is what made
+`gent kort` also match Gentbrugge and Gentse.
+
+It has to be a subfield of the catch-all and not of the name: a finished token is very often
+the municipality or the postcode, which never appear in `primary_name`, so gating finished
+words against `primary_name.folded` throws away most multi-token queries.
+
+The completion suggester is fed something else entirely (`completionInputs()`): an FST only
+matches a prefix of a *whole* input, so the joined haystack would mean `gent` completes only
+documents whose haystack happens to start with `gent`. Each name is its own input, aliases
+listed separately — `Liège` and `Luik` are two things a user types, not one.
+
+### Step 3 — clean the source data before it becomes a document
+
+The register and the place export are both dirty, in different ways, and every repair below
+exists because of something that was visibly wrong without it.
+
+**Aggregate the register — always, whatever you end up indexing.** The openaddress files hold
+one row per individual address, which is the wrong granularity for most of autocomplete:
+nobody types a house number to find a street. One pass folds the 3,884,638 usable Flemish rows
+into 82,643 street, municipality and postcode documents, each with an averaged coordinate and
+an address count.
+
+That pass runs at **every** `--level`, and not only at street level, because the address count
+is the popularity prior for *every* document type — an individual house number inherits the
+count of the street it stands on, and without it the ranking cannot tell a 3-address alley
+from a main road. What `--level` decides is only which of the outputs are emitted as
+documents: the aggregates (`street`, the default), one document per house number (`address`),
+or both (`all`). The 4,029,990-document corpus everything here is measured on is `--level=all`
+plus the place export — 82,643 + 3,884,638 + 62,709.
+
+Rows that are not `current`, or that carry no postcode or no coordinates, are dropped before
+any of that.
+
+**Re-case the names.** The register mixes `HERSELT` with `Ramsel`. `NameFormatter::titleCase()`
+re-cases the all-caps values only, leaving already-mixed names like `'s-Gravenwezel` and
+`De Haan` alone, and puts Dutch/French particles (`de`, `van`, `sur`, `les`) back to lowercase
+when they are not the first word.
+
+**Unpack `postname`.** One field packs several sub-localities behind slashes
+(`Grimminge/Idegem/Nieuwenhove`). One is shown next to the postcode — the sub-locality when
+the postcode maps to exactly one, the municipality otherwise — and all of them become aliases.
+
+**Fill aliases deliberately.** Every document carries the other languages' spelling of its
+name, the sub-localities behind its postcode, and its municipality name. They are n-grammed
+like the primary name and scored by their own clause at `BOOST_ALIAS` (1.8). Without the
+municipality translations, `rue de seraing liege` matches the street and then loses on the
+city token it cannot find, because the label says `Luik`. The boost sits deliberately *below*
+`BOOST_NAME_MATCH`: the municipality is filed under aliases too, so a name-weighted clause
+would count the city twice for every document in the index.
+
+**Repair the place export, and count what you throw away.** UiTdatabank names and addresses
+are hand-entered JSON blobs per language. Whitespace runs and newlines are collapsed
+(otherwise they reach the dropdown verbatim), `Onkerzele (Geraardsbergen)` is split into
+sub-locality and municipality so the place is findable by either, and rows that are not in
+Belgium or whose postcode is not four digits are rejected — with the reason counted and
+reported, so "why is my place missing" is answerable without re-reading the CSV by hand.
+
+**Do not let a label repeat itself.** A place name in the export is whatever an organiser
+typed into a name field, and thousands of them are not venue names at all but localities
+(`Brussel`), postcode-and-locality pairs (`1000 Brussel`) or entire addresses. Appending the
+register address to those produced `1000 Brussel (1000 Brussel, 1000 Brussel)` — one fact
+spelled three times. `NameFormatter::placeLabel()` prints each half of the bracket only when
+it carries something the name does not, testing on **folded word boundaries**: folded because
+the export agrees with the register on nothing else (`9040 Sint-Amandsberg` against
+`9040 SINT AMANDSBERG`), on word boundaries because a shared prefix is not the same street
+(`Markt` must not match inside `Marktplein`). The test is one-directional — a half is dropped
+because the name already shows it, never because it looks unimportant — so it can shorten a
+label but never remove the only mention of something.
+
+**Give every document a popularity value.** For register documents it is the number of
+addresses behind them, which doubles as the ranking prior. Places have no usage signal in the
+export at all, so they get a flat 24 — the median number of addresses on a Flemish street,
+which puts a place level with a typical street on the popularity term and leaves the ordering
+to the tiers in step 6. It cannot be zero: `log1p(0) = 0` multiplies the whole score away and
+the document disappears.
+
+### Step 4 — read numbers as numbers
+
+This is the part that had the most defects in it, and the one most likely to be re-introduced
+by a reimplementation that treats a query as a bag of words. A Belgian address query mixes two
+kinds of number that look identical and mean opposite things: `kerkstraat 12 gent` and
+`kerkstraat 9000 gent`.
+
+**Classify the tokens** (`Normalizer`):
+
+| predicate | matches | used for |
+|---|---|---|
+| `isPostcodeToken()` | exactly 4 digits, `1000`–`9999` | the exact-postcode term clause |
+| `isHouseNumberToken()` | 1–4 digits plus up to 3 letters (`59`, `12a`, `3bis`), not a postcode | the locative/detail split |
+| `isNumericToken()` | digits plus up to 3 letters, *unbounded* in length | deciding whether a token may be prefix-matched at all |
+| `isBoxMarkerToken()` | `bus`, `bte`, `boite` | the box reference |
+
+The bare `b` of `12 b 5` is deliberately **not** a box marker on its own — it is the first
+keystroke of far too many street and municipality names — and is only read as one directly
+after a house number, where the ambiguity does not exist.
+
+**Split the query into locative and detail tokens** (`SuggestQuery`). `kerkstraat 12 bus 5
+gent` is two questions in one string: *which* Kerkstraat (street, postcode, municipality) and
+*where on it* (number, box). Only the locative half reaches the recall gate. A street document
+carries no house number and `searchText()` never contains `box_number` at any level, so
+requiring them finds **nothing at all** for the most ordinary way a Belgian writes an address.
+That was not a tuning issue, it was zero results on `kerkstraat 2 gent`.
+
+Two guards belong to the split:
+
+- **A query made of nothing but detail does not split.** On a bare `22` the number is all the
+  user gave us, so it has to keep narrowing; otherwise the gate is empty and matches the whole
+  index. (The guard earns its keep in both directions: `bus` on its own is a street in Eeklo.)
+- **The house number stops being detail once the index contains house numbers.** At address
+  level the number is the most selective token in the query and belongs in the gate:
+  `kerkstraat 12 gent` gates down to 413 candidates with the split and **2** without, and the
+  two are the right ones. The `HOUSE_NUMBERS_INDEXED` flag names the corpus, not the
+  mechanism, because the corpus is the thing an operator actually knows. The box reference is
+  never in the gate, whatever the index holds.
+
+**Do not prefix-match a trailing number.** The trailing token is normally treated as a prefix,
+because it is the one still being typed. A trailing *number* is the exception, and this is the
+single most expensive defect the POC found. Because `searchText()` folds street, number,
+postcode and municipality into one string, a prefix cannot know which of them it landed on,
+and every Belgian postcode is four digits:
+
+```
+"anspachlaan 100"  ->  gate term "100"  ->  edge n-grams of "1000"  =  1, 10, 100, 1000
+```
+
+`kerkstraat 90` admitted 885 documents — every place in 9050 Gentbrugge, 9060 Zelzate, 9080
+Zaffelare and 9000 Gent — and **not one** of the 46 documents actually standing at Kerkstraat
+90 was reachable. The gate is the one stage nothing downstream can undo, so it had turned the
+most selective token in the query into the least selective one. The rule
+(`SuggestQuery::isTypingLocative()`, `::isBareNumeric()`):
+
+- **A number is read as a postcode being typed only when it is the whole query.** A bare `22`
+  really is someone typing a postcode — there is no street for it to be a number *of* — and
+  there the prefix reading is the only one that means anything.
+- **A number standing next to a name is a house number by construction.** It is gated as a
+  whole word and gets no partial-postcode boost. A complete four-digit postcode still matches
+  exactly, because it is a whole word either way.
+
+**Score numbers, separately from gating them** (`postcodeClauses()`, `addressDetailClauses()`):
+
+| clause | boost | field | note |
+|---|---|---|---|
+| exact postcode | 6.0 | `postcode` (keyword term) | a complete 4-digit token the document carries |
+| partial postcode | 3.0 | `postcode.text` (n-grammed) | a 1–3 digit token, **only** on a bare numeric query and only when trailing |
+| house number / box | 4.0 | `search_text.folded` | whole-word, never a prefix: prefixing would let `5` score 59, 5A and 512 alike |
+
+There is deliberately no clause on the `house_number` field: it is an unfolded keyword holding
+the raw register value (`12A`) while query tokens arrive lowercased, so a term lookup would
+miss exactly the numbers that have a letter suffix. Numbers reach the query through
+`search_text`, which is folded on both sides.
+
+### Step 5 — recover from an empty result set with a ladder, not a looser gate
+
+The gate is strict by design, so one wrong token yields zero results rather than a slightly
+worse list. A looser `should` clause cannot fix that — a `should` can only reorder documents
+the `must` already admitted — so every recovery is its own query, run only when the previous
+one came back empty. The common path stays at one round trip.
+
+| pass | gate | answers |
+|---|---|---|
+| `strict` | every locative token, trailing one as a prefix | the common case |
+| `no_number` | every *name* token exactly, number demoted to ranking | a number that is not on the street typed |
+| `fuzzy` | fuzziness itself, numbers dropped entirely | a misspelt street |
+
+**The order is the point.** The number is given up before the name, because the number is
+exact evidence and the name is not. And fuzziness has to come last: an n-grammed field is
+loose enough to reach *Goormansdijk* from `goorbaan`, so a fuzzy pass promoted above
+`no_number` buries the street the user actually typed. `goorbaan 22` (no number 22 on the
+Goorbaan) answers with *Goorbaan, 2230 Herselt* and the numbers it does have.
+
+Numbers are **dropped** from the fuzzy pass rather than fuzzified: edit distance over digits
+is not a typo model but a random number generator — `100` is one edit from 110, 200, 180 *and*
+10, and on an n-grammed field it reaches every `100x` postcode as well. Conversely
+`fuzzy_transpositions` must be on and `prefix_length` 1: `antwrepen` is one transposition from
+`antwerpen` but two plain edits, and that is the difference between the fallback working and
+not working for the most common class of typo. Note also that Elasticsearch does **not** apply
+fuzziness to the trailing prefix term of a `match_bool_prefix`, which is why the fuzzy pass is
+a plain `match` for every method rather than each method's own prefix query.
+
+### Step 6 — ordering across document types
+
+This is the one thing no method decides by score alone, and it is two mechanisms, not one.
+
+**The hard part is a tier.** Results are grouped into three tiers, and score only decides the
+order *inside* a tier:
 
 | tier | types | why |
 |---|---|---|
@@ -74,14 +338,32 @@ tiers**, and score only decides the order *inside* a tier:
 | 1 | `place` | A venue is a more specific answer than the street it stands on. |
 | 2 | `street`, `address` | |
 
-The tier is one decision, defined once in `SuggestionType::rankTier()`; MySQL renders it as a
-`CASE` in the `ORDER BY` of every pass, Elasticsearch stores it as a `rank_tier` byte and
-sorts on it ahead of `_score`.
+The tier is one decision, defined once in `SuggestionType::rankTier()`. MySQL renders it as a
+`CASE` in the `ORDER BY` of every pass; Elasticsearch denormalises it onto the document as a
+`rank_tier` byte and sorts `rank_tier asc, _score desc`. It is denormalised rather than
+derived from `doc_type` because sorting needs doc values on a numeric field — the alternative
+is a script or runtime field evaluated per matching document, which turns a sub-millisecond
+sort into tens of milliseconds on a query like `straat` that matches most of the index. One
+byte per document buys that. Two details worth porting with it: `unmapped_type: byte` on the
+sort, so an index built before the field existed degrades to score order instead of returning
+a 400; and keeping `_score` as the secondary key, which is also what keeps `_score` populated
+on every hit under a field sort.
 
-It has to be a tier rather than a weight. A place and an address document can describe the
-same address, and on text the address wins every time — it is *named* after the street you
-typed, while the venue standing on it is not — so no boost small enough to be safe is large
-enough to overturn it. A tier states the preference directly: for `markt 62 berlaar`,
+**The soft part is a per-type weight**, inside the `function_score`: municipality 1.6,
+postcode 1.35, place 1.2, street 1.0, address 0.75, multiplied by a `log1p`-damped popularity
+factor. These fix a structural problem rather than express a preference — a municipality
+document competes against the 3,000 street documents inside it, every one of which also
+contains the city name, so on text alone a city can lose to its own streets. Popularity is
+damped hard on purpose (factor 0.5 makes a large city worth about 1.8× a village rather than
+100×; counter-intuitively a *larger* factor damps harder, because under a logarithm the ratio
+between two values shrinks as both are scaled up) and the whole function is capped at
+`max_boost: 15.0`, so no amount of popularity can overrun a genuinely better textual match.
+
+**Why the cross-type ordering has to be a tier and not a weight.** A place and an address
+document can describe the same address, and on text the address wins every time — it is
+*named* after the street you typed, while the venue standing on it is not. Scores here are
+unbounded (a good name match reaches four figures), so no weight small enough to be safe is
+large enough to overturn that. A tier states the preference directly: for `markt 62 berlaar`,
 `Baristik (Markt 62, 2590 Berlaar)` is listed above `Markt 62, 2590 Berlaar`.
 
 **Place earns a tier of its own rather than sharing tier 0.** While it shared the top tier
@@ -89,11 +371,31 @@ with municipality and postcode, *any* matching place outranked *every* street an
 unconditionally — on `kerkstraat gent` the Kerkstraat itself came fifth, behind four venues
 standing in it that scored a third as well (89.8 against 153.1), because `rank_tier` sorts
 before `_score`. A separate tier keeps the intended ordering without that side effect: a venue
-beats the street it stands on, but never the town it stands in.
+beats the street it stands on, but never the town it stands in. Sharing tier 2 would not work
+either — the choice would fall to the 1.2 weight, which a strong street match overruns.
 
 One consequence to keep in mind when reading the quality numbers below: places above streets
 is a deliberate product choice, and `benchmark/golden.json` predates it. Its expectations are
 `street:` ids, so a place ranking first counts as a miss.
+
+### If only part of this gets ported
+
+In the order the results degrade, worst first:
+
+1. **The locative/detail split** (step 4). Without it every ordinary `street number city`
+   query returns zero results.
+2. **The whole-word gating of a trailing number** (step 4). Without it the most selective
+   token in the query becomes the least selective one, silently — the query still returns
+   results, they are simply the wrong postcode's.
+3. **Folding parity between index and query side** (step 1), including the keyword
+   normaliser. Without it the exact-name clause never fires and accented or apostrophised
+   names match inconsistently.
+4. **The search-time analyser split** (step 1). Without it precision collapses while the
+   result list still looks plausible, which is the hardest of these to notice.
+5. **The tier sort** (step 6). Without it the ordering across document types is decided by
+   whichever text match happened to score higher.
+6. **The recovery ladder** (step 5) and the label/name repairs (step 3). These are quality,
+   not correctness — the results are right, they are merely thinner or uglier.
 
 ## The benchmark
 
@@ -181,27 +483,35 @@ and not as a candidate.
 
 ### What the methods cost to index
 
-Measured twice: at **street level** (82,643 documents, `--level=street`) and at **address
-level** (4,029,990 documents — the full house-number file plus the UiTdatabank places), both
-force-merged to one segment and measured with
-`POST /<index>/_disk_usage?run_expensive_tasks=true`.
+Measured three times, each force-merged to one segment and measured with
+`POST /<index>/_disk_usage?run_expensive_tasks=true`:
 
-| | street level, 82,643 docs | address level, 4,029,990 docs |
-|---|---|---|
-| index size, incumbent mapping only | 40.8 MB | — |
-| index size, all five methods | 107.5 MB | **3.5 GB** |
+- **street level**, 82,643 documents (`--level=street`, Flanders only)
+- **address level, Flanders**, 4,029,990 documents (the Flemish house-number file plus the
+  UiTdatabank places)
+- **address level, all three regions**, 6,863,736 documents (adding
+  `openaddress-bebru.csv` and `openaddress-bewal.csv`)
 
-49× the documents costs 33× the index. Note what that 3.5 GB is, though: **one index carrying
-all five methods at once**, which is the price of comparing them on identical documents and
-not the price of shipping any one of them. The per-method split is what matters:
-
-| method | fields | street level | address level |
+| | street, 82,643 | address FL, 4,029,990 | address BE, 6,863,736 |
 |---|---|---|---|
-| `es-bool-prefix` | — (reuses `search_text.folded`, `primary_name.folded`) | **0.0 MB** | **0 MB** |
-| `es-completion` | `suggest` | 6.1 MB | 253 MB |
-| `elasticsearch` | `search_text` + `primary_name` | 12.9 MB | 376 MB |
-| `es-prefixes` | the two `._index_prefix` structures | 12.9 MB | 376 MB |
-| `es-sayt` | eight subfields; `search_text_sayt._index_prefix` alone is 904 MB | 38.8 MB | 1,299 MB |
+| index size, incumbent mapping only | 40.8 MB | — | — |
+| index size, all five methods | 107.5 MB | 3.5 GB | **6.31 GB** |
+
+Note what that 6.31 GB is: **one index carrying all five methods at once**, which is the price
+of comparing them on identical documents and not the price of shipping any one of them. The
+per-method split is what matters:
+
+| method | fields | street | address FL | address BE |
+|---|---|---|---|---|
+| `es-bool-prefix` | — (reuses `search_text.folded`, `primary_name.folded`) | **0.0 MB** | **0 MB** | **0 MB** |
+| `es-completion` | `suggest` | 6.1 MB | 253 MB | 436 MB |
+| `elasticsearch` | `search_text` + `primary_name` | 12.9 MB | 376 MB | 615 MB |
+| `es-prefixes` | the two `._index_prefix` structures | 12.9 MB | 376 MB | 615 MB |
+| `es-sayt` | eight subfields; `search_text_sayt._index_prefix` alone is 1,648 MB | 38.8 MB | 1,299 MB | 2,434 MB |
+
+The three largest single fields on the full index are `search_text_sayt._index_prefix`
+(1,648 MB), `_source` (944 MB) and `search_text` (439 MB) — and `_source` outweighing every
+method but one is worth remembering before optimising any of them.
 
 **"0 MB" is marginal, not absolute.** Every method rides on fields the index has to carry
 anyway — `_source`, doc values, the keyword and whole-word fields, the geo point.
@@ -209,9 +519,10 @@ anyway — `_source`, doc values, the keyword and whole-word fields, the geo poi
 `search_text.folded` and `primary_name.folded`, which exist for the other methods' ranking
 clauses regardless. The figures above are each method's own addition to the bill.
 
-The proportions survive the change of scale almost exactly, which is the useful part: these
+The proportions survive two changes of scale almost exactly, which is the useful part: these
 ratios are a property of the methods, not of this corpus. `search_as_you_type` is a third of
-the whole index at both sizes.
+the whole index at all three sizes, and `es-prefixes` tracks the edge-n-gram incumbent to
+within 0.05% at 6.9M documents just as it did at 82k.
 
 Two things worth stating plainly, because this README previously guessed at both:
 
@@ -222,7 +533,8 @@ Two things worth stating plainly, because this README previously guessed at both
   than `max_chars` still matches, just by scanning.
 - **`search_as_you_type` is expensive**, exactly as the article warns: three times the
   incumbent's index for this data, most of it the `_index_prefix` of the shingled catch-all
-  field. It is the convenient option, not the cheap one.
+  field. It is the convenient option, not the cheap one — and it scales worst of the five:
+  from 4.03M to 6.86M documents it grew by 1,135 MB while the incumbent grew by 239 MB.
 
 ### What the methods cost to query
 
@@ -414,7 +726,7 @@ and neither changed the choice above:
 
 - **How UiTdatabank places rank against addresses** — by tier, not by score. A place outranks
   the street it stands on and is outranked by the town it stands in; see
-  [Ordering across document types](#ordering-across-document-types). It is a product choice
+  [Step 6](#step-6--ordering-across-document-types). It is a product choice
   rather than a measurement, and `benchmark/golden.json` still predates it.
 - **Whether house-number labels get indexed** — yes, and it is what
   [`HOUSE_NUMBERS_INDEXED`](README.md#house-numbers-and-the-gate) exists for. At address level
@@ -434,16 +746,12 @@ what it costs to try.
 Three fields existed in the mapping and did nothing in the query. Two of them are now wired
 up; the third is the geo signal, which is a feature rather than a loose end.
 
-- **`primary_name.keyword`** — *done.* It now carries the `folding_keyword` normaliser, so the
-  single term it stores is byte-for-byte what `SuggestQuery::normalized()` sends, and
-  `BOOST_NAME_EXACT` (12.0, above `BOOST_NAME_PHRASE_PREFIX`) fires on it. Without the
-  normaliser the subfield holds `Goorbaan` while the query side sends `goorbaan`, so the
-  "one clause" this used to describe would have matched nothing — the folding is the fix, the
-  clause is the easy half.
-- **`aliases`** — *done.* Now n-grammed like `primary_name` and carried by its own clause at
-  `BOOST_ALIAS` (1.8). Deliberately *not* "scored like a name hit", as the old comment
-  claimed: `DocumentSource::aliases()` also files the municipality name under aliases, so a
-  name-weighted clause would count the city twice for every document in the index.
+- **`primary_name.keyword`** — *done.* It carries the `folding_keyword` normaliser, which is
+  what lets `BOOST_NAME_EXACT` (12.0) ever fire; the folding was the fix, the clause was the
+  easy half. See [Step 1](#step-1--one-folding-applied-to-both-sides).
+- **`aliases`** — *done.* N-grammed like `primary_name` and carried by its own clause at
+  `BOOST_ALIAS` (1.8), deliberately below the name boosts. See
+  [Step 3](#step-3--clean-the-source-data-before-it-becomes-a-document).
 - **`location`** (`ElasticsearchMapping.php`) is a `geo_point` that contributes nothing to the
   score. See [Geo](#geo-the-unused-signal) below — it remains the largest single omission, and
   unlike the two above it needs an origin the API does not currently accept.
@@ -463,16 +771,10 @@ before, despite gaining `search_text.folded`, n-grammed `aliases` and a normalis
 
 No reindex required for any of these.
 
-**Completed tokens are matched as prefixes too** — *done.* The recall gate used to run
-*every* token against the edge-n-grammed `search_text`, so in `meir antwerpen` the finished
-token `meir` also admitted *Meirbrug*. `ElasticsearchSuggester::gateClauses()` now splits the
-query the way `SuggestQuery::completeTokens()` and `::lastToken()` always described it: every
-finished token has to match a whole word, against a new non-n-grammed `search_text.folded`
-subfield, and only the token still being typed matches a prefix.
-
-Note this needs the `.folded` subfield rather than `primary_name.folded` as first sketched
-here — a completed token is very often the municipality or the postcode, which never appear
-in the primary name, so gating on the name would have thrown away most multi-token queries.
+**Completed tokens are matched as prefixes too** — *done*, and it is now the two-field gate of
+[Step 2](#step-2--one-deduplicated-haystack-per-document). The gate used to run *every* token
+against the edge-n-grammed `search_text`, so in `meir antwerpen` the finished token `meir`
+also admitted *Meirbrug*.
 
 Measured over the 106-query benchmark set, the narrower gate changes the candidate set for 5
 queries, by one or two documents each, and takes no query to zero results. Golden-set MRR
@@ -496,21 +798,8 @@ Elasticsearch:
 | `meir 1 antwerpen` | 3 | **0** | 1 — *Meir, 2000 Antwerpen* |
 | `veldstraat 10 9000` | 3 | **0** | 1 — *Veldstraat, 9000 Gent* |
 
-A street document carries no house number, so demanding one finds nothing; `bus` is worse
-still, because `SuggestionDocument::searchText()` never puts `box_number` into the haystack at
-any level, so the word can never match in either engine.
-
-`SuggestQuery` now splits the tokens into **locative** ones (the street, the postcode, the
-municipality — what can narrow a search) and **address detail** (house number, box marker, box
-number). Only the locative half reaches the gate; the detail half moves to a `should` at
-`BOOST_ADDRESS_DETAIL`, which is what puts number 59 first on an address-level index and
-harmlessly scores zero on a street-level one. Query-side only — **no reindex**.
-
-Two details worth knowing. The token still being typed is only treated as a prefix while it is
-still part of the place name: in `goorbaan 5` the street is finished, so it is gated as a whole
-word. And a query made of *nothing but* detail does not split — on a bare `22` the number is
-all the user has given us, so it has to keep narrowing. (That guard earns its keep: `bus` on
-its own is a street in Eeklo.)
+The fix is the locative/detail split of [Step 4](#step-4--read-numbers-as-numbers), and it is
+query-side only — **no reindex**.
 
 MySQL was never doing this properly either. Its boolean query for `kerkstraat 12 bus 5` is
 `+kerkstraat* +bus*` — it drops `12` and `5` only because they are shorter than
@@ -520,21 +809,11 @@ Elasticsearch fix does not mirror it.
 
 **A typed house number was matching the postcode** — *done, and the most expensive defect
 found so far.* The sequel to the fix above, and it only exists *because* of it: once
-`HOUSE_NUMBERS_INDEXED=1` puts the number back in the gate, the number is gated as a
-**prefix**, because it is the trailing token and the trailing token is what the user is still
-typing. But `SuggestionDocument::searchText()` folds the street, the house number, the
-postcode and the municipality into **one string**, so a prefix does not know which of those
-it landed on. Every Belgian postcode is four digits, so every house number of one to three
-digits is a prefix of one:
-
-```
-"anspachlaan 100"  ->  gate term "100"  ->  edge n-grams of "1000"  =  1, 10, 100, 1000
-```
-
-That is most house numbers in the country. The gate — the one stage nothing downstream can
-undo — turned the most selective token in the query into the least selective, and then
-`postcodeClauses()` paid the wrongly-admitted documents a `BOOST_POSTCODE_PARTIAL` of 3.0 for
-a postcode the user never typed:
+`HOUSE_NUMBERS_INDEXED=1` puts the number back in the gate, the number was gated as a prefix
+and prefix-matched every postcode beginning with it — the mechanism, and the rule that now
+prevents it, are [Step 4](#step-4--read-numbers-as-numbers). On top of the wrongly widened
+gate, `postcodeClauses()` then paid the wrongly-admitted documents a
+`BOOST_POSTCODE_PARTIAL` of 3.0 for a postcode the user never typed:
 
 | query | candidates before | of those, at the number typed | candidates after |
 |---|---|---|---|
@@ -554,33 +833,14 @@ methods is the tell that this lived in the shared layer and not in any one metho
 at all, because the FST only matches a prefix of a whole input.)
 
 The fix is the shape the user reporting it proposed, and it is query-side only — **no
-reindex**:
-
-- **A number is read as a postcode only when it is the whole query.** A bare `22` really is
-  someone typing a postcode, and there it keeps its prefix reading (`22` → 2200 Herentals,
-  2220 Heist-op-den-Berg, …). A number standing next to a name is a house number by
-  construction, so it is gated as a **whole word** and gets no partial-postcode boost.
-  `SuggestQuery::isBareNumeric()` is the whole distinction.
-- **A four-digit postcode still matches exactly.** `anspachlaan 1000` gates on `1000` as a
-  word, which is what `postcode` documents and every document in 1000 Brussel carry.
-
-That alone fixes recall but leaves a new question: what should answer a number that is *not*
-on the street typed? Before the fix the fuzzy fallback caught it, and it caught it badly —
-fuzziness over digits is not a typo model but a random number generator (`100` is one edit
-from 110, 200, 180 *and* 10), and on the incumbent's n-grammed field it reaches every `100x`
-postcode as well. So the fallback is now a **three-step ladder**, and the order is the point:
-
-| pass | gate | answers |
-|---|---|---|
-| `strict` | every token, trailing one as a prefix | the common case |
-| `no_number` | every *name* token exactly, number demoted to ranking | a number not on that street |
-| `fuzzy` | fuzziness itself, numbers dropped | a misspelt street |
-
-The number is given up before the name because the number is exact evidence and the name is
-not. `goorbaan 22` (no number 22 on the Goorbaan) now answers with *Goorbaan, 2230 Herselt*
-and the numbers it does have; before the ladder its fuzzy pass led with two places on the
-*Goormansdijk*, which an n-grammed field is loose enough to reach from `goorbaan`. Fuzziness
-has to come last or it buries the street the user actually typed.
+reindex**: the number is gated as a whole word unless it is the entire query
+([Step 4](#step-4--read-numbers-as-numbers)). That alone fixes recall but leaves a new
+question — what should answer a number that is *not* on the street typed — and the answer is
+the second rung of the recovery ladder
+([Step 5](#step-5--recover-from-an-empty-result-set-with-a-ladder-not-a-looser-gate)).
+`goorbaan 22` (no number 22 on the Goorbaan) now answers with *Goorbaan, 2230 Herselt* and the
+numbers it does have; before the ladder its fuzzy pass led with two places on the
+*Goormansdijk*.
 
 MySQL got the same `no_number` pass, and two smaller corrections that only became visible
 once its gate was exact. Numbers are no longer eligible as its `fuzzyToken()` target — in
