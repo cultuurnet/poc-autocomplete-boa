@@ -212,6 +212,19 @@ Per method, the fields it alone needs:
 | `es-prefixes` | the two `._index_prefix` structures | 12.9 MB | 376 MB |
 | `es-sayt` | eight subfields; `search_text_sayt._index_prefix` alone is 904 MB | 38.8 MB | 1,299 MB |
 
+**"0 MB" is a marginal figure, not a free lunch.** Every method pays the same baseline before
+any of this: parsing the CSV, aggregating it, building `_source`, doc values, the keyword and
+whole-word fields, the geo point. `es-bool-prefix` adds *nothing on top of that baseline* — it
+queries fields the index has to carry anyway — which is a different claim from importing being
+free. The same goes for the import times: the 1,131.9 s above is one index carrying all five
+methods at once, not any single method's bill.
+
+What is measured, at street level, is the two ends of that range: the incumbent mapping alone
+imports in 23.9 s, and the same documents with all five methods take 38.9 s. So the four added
+methods together cost **+63%** of import time. The per-method split inside that +63% has not
+been measured — the disk figures below are the best available proxy, and they suggest
+`es-sayt` accounts for most of it.
+
 The proportions survive the change of scale almost exactly, which is the useful part: these
 ratios are a property of the methods, not of this corpus. `search_as_you_type` is a third of
 the whole index at both sizes.
@@ -345,7 +358,8 @@ lower precision. Which is better is a product question the numbers are meant to 
 - **A prefix index does earn its keep, but only on the first two keystrokes.** That is the one
   place `es-bool-prefix` loses, and the one place it loses badly and worse with scale (3.2× at
   four million documents). Whether that matters is a product question: 6.6 ms is still fast,
-  and it buys back 376 MB and nineteen minutes of import.
+  and it buys back the 376 MB `es-prefixes` adds, plus whatever share of import time building
+  those two prefix structures costs — see the note on what "0 MB" means below.
 - `es-sayt` costs 3.4× the index of `es-prefixes` for the same behaviour. Convenience, not
   capability.
 - `es-completion` is a genuine sub-millisecond floor (0.69 ms p50 on four million documents)

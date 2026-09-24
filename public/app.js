@@ -36,9 +36,10 @@ const COLUMNS = ['left', 'right'];
  * edge-n-gram chain on every axis measured, for the same index, and needs no
  * MAX_GRAM cliff or preserve_original workaround. es-bool-prefix is the best
  * method with no prefix index at all - highest golden-set score of the five at
- * both corpus sizes, indistinguishable at the median, 0 MB and no import cost -
- * and it loses only on the first two keystrokes, where its term-dictionary scan
- * runs 3.2x slower at four million documents.
+ * both corpus sizes, indistinguishable at the median, and no fields of its own
+ * to build on top of the ones the index carries anyway - and it loses only on
+ * the first two keystrokes, where its term-dictionary scan runs 3.2x slower at
+ * four million documents.
  *
  * That trade is what the two columns are for. MySQL and the incumbent are one
  * click away in either picker; they are just not open questions any more.
@@ -76,13 +77,6 @@ const FALLBACK_METHODS = [
 ];
 
 /**
- * Caveats that are about how a method *works*, not about how it is doing, so
- * they are hardcoded here rather than read from the health payload: the note
- * has to be right on the very first paint, before any request has answered,
- * and it must not change wording because a server-side description was
- * reworded. Only methods that would otherwise be misread need an entry.
- */
-/**
  * Plain-language answers to "what is this one, then?", behind the ? button.
  *
  * Client-side for the same reason as METHOD_NOTES below: this has to be right
@@ -112,6 +106,13 @@ const METHOD_EXPLAINERS = {
     + 'The catch is that it only matches from the beginning of a single name - "kerkstraat gent" finds nothing - and it orders results purely by how big the place is.',
 };
 
+/**
+ * Caveats that are about how a method *works*, not about how it is doing, so
+ * they are hardcoded here rather than read from the health payload: the note
+ * has to be right on the very first paint, before any request has answered,
+ * and it must not change wording because a server-side description was
+ * reworded. Only methods that would otherwise be misread need an entry.
+ */
 const METHOD_NOTES = {
   'es-completion': 'Ranks on indexed popularity alone: no multi-token reordering, no house numbers, no meaningful total.',
 };

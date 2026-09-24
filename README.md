@@ -417,8 +417,8 @@ the incumbent Elasticsearch query as before, or two Elasticsearch methods agains
 
 It **opens on `es-prefixes` against `es-bool-prefix`**, because those are the two methods
 still worth arguing about: the best indexed method against the best method with no prefix
-index at all, which is the same question as "is 376 MB and nineteen minutes of import worth
-5 ms on one-character queries?". MySQL and the incumbent edge-n-gram query are one click away
+index at all, which is the same question as "is an extra 376 MB of index, and the time to
+build it, worth 5 ms on one-character queries?". MySQL and the incumbent edge-n-gram query are one click away
 in either picker; they are just not open questions any more — MySQL is 134× slower at
 house-number level, and the incumbent is matched or beaten by `es-prefixes` on every axis
 measured.
