@@ -791,6 +791,12 @@ function buildRow(column, suggestion, index, ranks) {
     meta.append(el('span', 'pop', `pop ${suggestion.popularity}`));
   }
 
+  const entryPoint = buildEntryPointLink(suggestion);
+
+  if (entryPoint) {
+    meta.append(entryPoint);
+  }
+
   meta.append(buildOverlapTag(column, suggestion, index, ranks));
   row.append(meta);
 
@@ -812,6 +818,37 @@ function buildRow(column, suggestion, index, ranks) {
   });
 
   return row;
+}
+
+const PLACE_UUID = /^place:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
+/**
+ * A place suggestion carries the UiTdatabank cdbid in its id, as
+ * "place:<uuid>". Nothing else in the payload identifies the venue, so the
+ * link is only offered when the id really has that shape.
+ */
+function buildEntryPointLink(suggestion) {
+  if (suggestion.type !== 'place') {
+    return null;
+  }
+
+  const uuid = PLACE_UUID.exec(suggestion.id ?? '');
+
+  if (!uuid) {
+    return null;
+  }
+
+  const link = el('a', 'entry-point', 'UiTdatabank');
+
+  link.href = `https://io.uitdatabank.be/places/${uuid[1]}`;
+  link.target = '_blank';
+  link.rel = 'noopener';
+  link.title = 'Open this place in UiTdatabank';
+  // The row itself pins on click; opening the link should not also move the
+  // cursor.
+  link.addEventListener('click', (event) => event.stopPropagation());
+
+  return link;
 }
 
 /**
