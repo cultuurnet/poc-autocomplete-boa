@@ -475,6 +475,7 @@ public/                  front controller + the comparison UI
 sql/schema.sql           readable reference for the MySQL table
 benchmark/               query set and golden expectations
 docker/                  php, nginx and mysql configuration
+docker/railway/          the hosted variant, see below
 ```
 
 Configuration is environment variables only, read in `src/Config.php`; `docker-compose.yml`
@@ -486,6 +487,24 @@ It has no default — `CSV_PATH` can pin one for an environment that always read
 file, and otherwise the option is required. The other defaults are the compose values, so
 `bin/console` also runs from the host against the forwarded ports if you copy `.env.example`
 to `.env` and use the host values noted in it.
+
+## Hosting on Railway
+
+The hosted copy is one Railway project with four services, all built from this repository
+and redeployed on every push to `main`:
+
+| Service | Dockerfile | Notes |
+|---|---|---|
+| `web` | `docker/railway/web.Dockerfile` | nginx and PHP-FPM in one container (`docker/railway/start-web.sh`), the only service with a public domain |
+| `importer` | `docker/railway/web.Dockerfile` | the same image, start command `bin/railway-import`, restart policy *never*: a one-off run |
+| `elasticsearch` | `docker/railway/elasticsearch.Dockerfile` | 8.19.12, single node, no auth, private network only; fixes the volume's owner and drops to uid 1000 before starting |
+| `mysql` | `docker/railway/mysql.Dockerfile` | 8.4 with `docker/mysql/my.cnf` |
+
+`bin/railway-import` downloads the three address registers from BOSA itself and imports
+them at `--level=all` with one worker per region, so nothing large has to leave a laptop. The
+UiTdatabank place export is not public; it is read from the project's private bucket, where
+it has to be uploaded as `export_places_udb.csv` before the importer runs. To reload the
+data, redeploy the `importer` service.
 
 ## Troubleshooting
 

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Start command of the Railway "importer" service: a one-off run that loads the
+# full corpus (all three regions, house-number level, plus the UiTdatabank
+# places) into the hosted MySQL and Elasticsearch, then exits.
+#
+# The address registers are public, so they are downloaded here, next to the
+# engines, rather than pushed from a laptop. The place export is not: it is
+# fetched from the project's private bucket (BUCKET_* variables), where it has
+# to be uploaded as export_places_udb.csv first. Without those variables the
+# places are skipped.
+set -euo pipefail
+
+WORK_DIR="${IMPORT_WORK_DIR:-/tmp/import}"
+REGIONS=(bevlg bewal bebru)
+
+mkdir -p "$WORK_DIR"
+cd /app
+
+csv_args=()
+for region in "${REGIONS[@]}"; do
+    csv="$WORK_DIR/openaddress-$region.csv"
+    if [[ ! -f "$csv" ]]; then
+        echo ">> downloading openaddress-$region"
+        curl -fsSL -o "$WORK_DIR/$region.zip" "https://opendata.bosa.be/download/best/openaddress-$region.zip"
+        unzip -o -q "$WORK_DIR/$region.zip" -d "$WORK_DIR"
+        rm "$WORK_DIR/$region.zip"
+    fi
+    csv_args+=("--csv=$csv")
+done
+
+php bin/console import --engine=all --level=all --recreate --workers="${#REGIONS[@]}" "${csv_args[@]}"
+
+if [[ -n "${BUCKET_ENDPOINT:-}" ]]; then
+    echo ">> downloading export_places_udb.csv from bucket $BUCKET_NAME"
+    curl -fsSL -o "$WORK_DIR/export_places_udb.csv" \
+        --aws-sigv4 "aws:amz:${BUCKET_REGION}:s3" \
+        --user "${BUCKET_ACCESS_KEY_ID}:${BUCKET_SECRET_ACCESS_KEY}" \
+        "${BUCKET_ENDPOINT%/}/${BUCKET_NAME}/export_places_udb.csv"
+    php bin/console import-places --engine=all --recreate --csv="$WORK_DIR/export_places_udb.csv"
+else
+    echo ">> BUCKET_ENDPOINT not set, skipping the place export"
+fi
+
+php bin/console health
+echo ">> import finished"

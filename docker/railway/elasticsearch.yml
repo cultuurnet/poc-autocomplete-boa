@@ -1,0 +1,9 @@
+cluster.name: "docker-cluster"
+
+# Railway's private network is IPv6; "::" listens on IPv4 as well.
+network.host: "::"
+
+discovery.type: single-node
+
+# POC only: no TLS, no auth. The service has no public domain.
+xpack.security.enabled: false
