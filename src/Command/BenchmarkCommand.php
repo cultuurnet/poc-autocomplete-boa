@@ -234,6 +234,7 @@ final class BenchmarkCommand extends Command
         // Read once, not per query: it is a property of the index the run is
         // pointed at, and it must not change halfway through a measurement.
         $houseNumbers = $this->container->config->houseNumbersIndexed;
+        $tierSort = $this->container->config->tierSort;
 
         foreach (array_keys($suggesters) as $engine) {
             $samples[$engine] = [];
@@ -248,7 +249,7 @@ final class BenchmarkCommand extends Command
             foreach ($suggesters as $suggester) {
                 for ($i = 0; $i < $warmup; ++$i) {
                     try {
-                        $suggester->suggest(new SuggestQuery($query, $limit, [], $fuzzy, $houseNumbers));
+                        $suggester->suggest(new SuggestQuery($query, $limit, [], $fuzzy, $houseNumbers, $tierSort));
                     } catch (Throwable) {
                         // Counted below, during the timed runs.
                     }
@@ -262,7 +263,7 @@ final class BenchmarkCommand extends Command
             foreach ($queries as $query) {
                 foreach ($suggesters as $engine => $suggester) {
                     try {
-                        $result = $suggester->suggest(new SuggestQuery($query, $limit, [], $fuzzy, $houseNumbers));
+                        $result = $suggester->suggest(new SuggestQuery($query, $limit, [], $fuzzy, $houseNumbers, $tierSort));
                     } catch (Throwable $e) {
                         ++$errors[$engine];
                         $this->recordError($engine, $query, $e);
@@ -324,11 +325,12 @@ final class BenchmarkCommand extends Command
         array &$errors,
     ): void {
         $houseNumbers = $this->container->config->houseNumbersIndexed;
+        $tierSort = $this->container->config->tierSort;
 
         foreach ($queries as $query) {
             foreach ($suggesters as $engine => $suggester) {
                 try {
-                    $captured[$engine][$query] = $suggester->suggest(new SuggestQuery($query, $limit, [], $fuzzy, $houseNumbers))->suggestions;
+                    $captured[$engine][$query] = $suggester->suggest(new SuggestQuery($query, $limit, [], $fuzzy, $houseNumbers, $tierSort))->suggestions;
                 } catch (Throwable $e) {
                     ++$errors[$engine];
                     $this->recordError($engine, $query, $e);

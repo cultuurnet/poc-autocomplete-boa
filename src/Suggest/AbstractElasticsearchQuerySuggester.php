@@ -375,7 +375,9 @@ abstract class AbstractElasticsearchQuerySuggester extends AbstractElasticsearch
             // comparison therefore holds constant. es-completion cannot have
             // it: the suggest API takes no sort, which is one more way that
             // method is not the same shape as the other four.
-            'sort' => [
+            //
+            // With TIER_SORT off the sort is left out and ES orders by _score.
+            'sort' => $query->tierSort ? [
                 // unmapped_type matters: sorting on a field an index does not
                 // have is a 400, so without it every query against an index
                 // built before rank_tier existed fails outright instead of
@@ -383,7 +385,7 @@ abstract class AbstractElasticsearchQuerySuggester extends AbstractElasticsearch
                 // cost a re-import, not an outage.
                 ['rank_tier' => ['order' => 'asc', 'unmapped_type' => 'byte']],
                 ['_score' => 'desc'],
-            ],
+            ] : null,
             'query' => [
                 'function_score' => [
                     'query' => [

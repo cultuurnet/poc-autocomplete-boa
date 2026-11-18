@@ -61,6 +61,7 @@ final class SuggestController
             self::types($params['types'] ?? null),
             self::fuzzy($params['fuzzy'] ?? null),
             $this->container->config->houseNumbersIndexed,
+            $this->container->config->tierSort,
         );
 
         $engines = $this->engines($params['engine'] ?? null);

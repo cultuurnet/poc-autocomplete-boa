@@ -54,6 +54,12 @@ final class SuggestQuery
          * because that is the thing an operator actually knows.
          */
         public readonly bool $houseNumbersIndexed = false,
+        /**
+         * Whether to group results by SuggestionType::rankTier() before score
+         * (Config::$tierSort). Off, the order across document types is decided
+         * by whichever text match scored higher.
+         */
+        public readonly bool $tierSort = true,
     ) {
         $this->tokens = Normalizer::tokenize($raw);
 

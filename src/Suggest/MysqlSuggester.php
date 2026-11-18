@@ -98,6 +98,12 @@ final class MysqlSuggester implements SuggesterInterface
      */
     private const FUZZY_PENALTY = 15.0;
 
+    /**
+     * SuggestQuery::$tierSort for the query being answered, held here so the
+     * passes that build SQL and the final merge read one value.
+     */
+    private bool $tierSort = true;
+
     public function __construct(
         private readonly PDO $pdo,
         private readonly string $table = 'location_suggestions',
@@ -114,6 +120,8 @@ final class MysqlSuggester implements SuggesterInterface
 
     public function suggest(SuggestQuery $query): SuggestResult
     {
+        $this->tierSort = $query->tierSort;
+
         if ($query->isEmpty()) {
             return new SuggestResult(self::ENGINE, [], 0.0, 0, ['skipped' => 'empty query, no statement sent']);
         }
@@ -413,11 +421,12 @@ final class MysqlSuggester implements SuggesterInterface
         // interpolating it avoids the PDO dance of binding LIMIT as PARAM_INT.
         $sql = sprintf(
             "SELECT c.*, (%s) AS score\nFROM (\n    SELECT %s\n    FROM `%s`\n    WHERE %s\n) AS c\n"
-                . "ORDER BY c.rank_tier ASC, score DESC, c.popularity DESC, c.id ASC\nLIMIT %d",
+                . "ORDER BY %sscore DESC, c.popularity DESC, c.id ASC\nLIMIT %d",
             $sum,
             implode(",\n           ", $select),
             $this->table,
             implode("\n      AND ", $where),
+            $this->tierSort ? 'c.rank_tier ASC, ' : '',
             $limit,
         );
 
@@ -923,8 +932,10 @@ final class MysqlSuggester implements SuggesterInterface
         //
         // Popularity and id as tie-breakers so two runs of the benchmark over
         // the same data produce the same list.
-        usort($candidates, static function (array $a, array $b): int {
-            return (int) $a['row']['rank_tier'] <=> (int) $b['row']['rank_tier']
+        $tierSort = $this->tierSort;
+
+        usort($candidates, static function (array $a, array $b) use ($tierSort): int {
+            return ($tierSort ? (int) $a['row']['rank_tier'] <=> (int) $b['row']['rank_tier'] : 0)
                 ?: $b['score'] <=> $a['score']
                 ?: (int) $b['row']['popularity'] <=> (int) $a['row']['popularity']
                 ?: strcmp((string) $a['row']['id'], (string) $b['row']['id']);

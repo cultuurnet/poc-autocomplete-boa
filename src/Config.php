@@ -22,6 +22,7 @@ final class Config
     public readonly string $elasticsearchIndex;
     public readonly bool $houseNumbersIndexed;
     public readonly bool $mysqlEnabled;
+    public readonly bool $tierSort;
 
     public function __construct()
     {
@@ -58,6 +59,11 @@ final class Config
         // the MySQL method then leaves the registry, so the UI, the health
         // check and the benchmark stop offering a store that is not there.
         $this->mysqlEnabled = self::flag('MYSQL_ENABLED', true);
+        // Whether results are grouped by SuggestionType::rankTier() before
+        // score. On by default because that is the ranking CONCLUSIONS.md
+        // describes; off leaves the order across document types to the score
+        // alone, to see what the tier is actually buying.
+        $this->tierSort = self::flag('TIER_SORT', true);
     }
 
     public function mysqlDsn(): string
