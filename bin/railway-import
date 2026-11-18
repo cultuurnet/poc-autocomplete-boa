@@ -37,11 +37,13 @@ done
 php bin/console import --engine="$engine" --level=all --recreate --workers="${#REGIONS[@]}" "${csv_args[@]}"
 
 if [[ -n "${BUCKET_ENDPOINT:-}" ]]; then
+    # Railway buckets are virtual-host style: https://<bucket>.<endpoint host>/<key>.
+    bucket_host="${BUCKET_ENDPOINT#https://}"
     echo ">> downloading export_places_udb.csv from bucket $BUCKET_NAME"
     curl -fsSL -o "$WORK_DIR/export_places_udb.csv" \
         --aws-sigv4 "aws:amz:${BUCKET_REGION}:s3" \
         --user "${BUCKET_ACCESS_KEY_ID}:${BUCKET_SECRET_ACCESS_KEY}" \
-        "${BUCKET_ENDPOINT%/}/${BUCKET_NAME}/export_places_udb.csv"
+        "https://${BUCKET_NAME}.${bucket_host%/}/export_places_udb.csv"
     php bin/console import-places --engine="$engine" --recreate --csv="$WORK_DIR/export_places_udb.csv"
 else
     echo ">> BUCKET_ENDPOINT not set, skipping the place export"
