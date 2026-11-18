@@ -13,6 +13,12 @@ set -euo pipefail
 WORK_DIR="${IMPORT_WORK_DIR:-/tmp/import}"
 REGIONS=(bevlg bewal bebru)
 
+# A deployment without MySQL (MYSQL_ENABLED off) imports into Elasticsearch only.
+engine=all
+if [[ "${MYSQL_ENABLED:-1}" =~ ^(0|false|no|off)$ ]]; then
+    engine=elasticsearch
+fi
+
 mkdir -p "$WORK_DIR"
 cd /app
 
@@ -28,7 +34,7 @@ for region in "${REGIONS[@]}"; do
     csv_args+=("--csv=$csv")
 done
 
-php bin/console import --engine=all --level=all --recreate --workers="${#REGIONS[@]}" "${csv_args[@]}"
+php bin/console import --engine="$engine" --level=all --recreate --workers="${#REGIONS[@]}" "${csv_args[@]}"
 
 if [[ -n "${BUCKET_ENDPOINT:-}" ]]; then
     echo ">> downloading export_places_udb.csv from bucket $BUCKET_NAME"
@@ -36,7 +42,7 @@ if [[ -n "${BUCKET_ENDPOINT:-}" ]]; then
         --aws-sigv4 "aws:amz:${BUCKET_REGION}:s3" \
         --user "${BUCKET_ACCESS_KEY_ID}:${BUCKET_SECRET_ACCESS_KEY}" \
         "${BUCKET_ENDPOINT%/}/${BUCKET_NAME}/export_places_udb.csv"
-    php bin/console import-places --engine=all --recreate --csv="$WORK_DIR/export_places_udb.csv"
+    php bin/console import-places --engine="$engine" --recreate --csv="$WORK_DIR/export_places_udb.csv"
 else
     echo ">> BUCKET_ENDPOINT not set, skipping the place export"
 fi

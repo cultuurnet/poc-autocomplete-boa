@@ -490,15 +490,17 @@ to `.env` and use the host values noted in it.
 
 ## Hosting on Railway
 
-The hosted copy is one Railway project with four services, all built from this repository
-and redeployed on every push to `main`:
+The hosted copy is one Railway project, built from this repository and redeployed on every
+push to `main`. It runs Elasticsearch only: `MYSQL_ENABLED=0` takes the MySQL method out of
+the registry, so the UI, the health check and the benchmark stop offering it, and the
+importer writes to Elasticsearch alone.
 
 | Service | Dockerfile | Notes |
 |---|---|---|
 | `web` | `docker/railway/web.Dockerfile` | nginx and PHP-FPM in one container (`docker/railway/start-web.sh`), the only service with a public domain |
 | `importer` | `docker/railway/web.Dockerfile` | the same image, start command `bin/railway-import`, restart policy *never*: a one-off run |
 | `elasticsearch` | `docker/railway/elasticsearch.Dockerfile` | 8.19.12, single node, no auth, private network only; fixes the volume's owner and drops to uid 1000 before starting |
-| `mysql` | `docker/railway/mysql.Dockerfile` | 8.4 with `docker/mysql/my.cnf` |
+| `mysql` | `docker/railway/mysql.Dockerfile` | 8.4 with `docker/mysql/my.cnf`; not deployed, here for a copy that does want the comparison |
 
 `bin/railway-import` downloads the three address registers from BOSA itself and imports
 them at `--level=all` with one worker per region, so nothing large has to leave a laptop. The

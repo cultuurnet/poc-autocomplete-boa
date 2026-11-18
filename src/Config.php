@@ -21,6 +21,7 @@ final class Config
     public readonly string $elasticsearchHost;
     public readonly string $elasticsearchIndex;
     public readonly bool $houseNumbersIndexed;
+    public readonly bool $mysqlEnabled;
 
     public function __construct()
     {
@@ -53,6 +54,10 @@ final class Config
         // wrong is not fatal either way, it just costs precision (false on an
         // address index) or recall (true on a street index).
         $this->houseNumbersIndexed = self::flag('HOUSE_NUMBERS_INDEXED', false);
+        // Off for a deployment that runs Elasticsearch alone (the hosted copy):
+        // the MySQL method then leaves the registry, so the UI, the health
+        // check and the benchmark stop offering a store that is not there.
+        $this->mysqlEnabled = self::flag('MYSQL_ENABLED', true);
     }
 
     public function mysqlDsn(): string

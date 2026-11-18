@@ -172,7 +172,7 @@ final class Container
      */
     public function suggester(string $key): SuggesterInterface
     {
-        $factory = $this->suggesters()[$key] ?? null;
+        $factory = $this->hasMethod($key) ? $this->suggesters()[$key] : null;
 
         if ($factory === null) {
             throw new InvalidArgumentException(sprintf(
@@ -183,6 +183,19 @@ final class Container
         }
 
         return $factory();
+    }
+
+    /**
+     * self::METHODS minus the backends this deployment does not run.
+     *
+     * @return array<string, array{label: string, backend: string, description: string}>
+     */
+    private function registry(): array
+    {
+        return array_filter(
+            self::METHODS,
+            fn (array $meta): bool => $meta['backend'] !== 'mysql' || $this->config->mysqlEnabled,
+        );
     }
 
     /**
@@ -197,12 +210,12 @@ final class Container
      */
     public function methodKeys(): array
     {
-        return array_keys(self::METHODS);
+        return array_keys($this->registry());
     }
 
     public function hasMethod(string $key): bool
     {
-        return isset(self::METHODS[$key]);
+        return isset($this->registry()[$key]);
     }
 
     /**
@@ -216,7 +229,7 @@ final class Container
     {
         $methods = [];
 
-        foreach (self::METHODS as $key => $meta) {
+        foreach ($this->registry() as $key => $meta) {
             $methods[] = ['key' => $key] + $meta;
         }
 
@@ -234,7 +247,7 @@ final class Container
     {
         $keys = [];
 
-        foreach (self::METHODS as $key => $meta) {
+        foreach ($this->registry() as $key => $meta) {
             if ($meta['backend'] === $backend) {
                 $keys[] = $key;
             }
@@ -258,7 +271,7 @@ final class Container
     {
         $backends = [];
 
-        foreach (self::METHODS as $key => $meta) {
+        foreach ($this->registry() as $key => $meta) {
             $backends[$meta['backend']] ??= $key;
         }
 
