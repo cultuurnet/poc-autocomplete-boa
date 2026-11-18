@@ -156,7 +156,7 @@ final class ImportCommand extends Command
             }
 
             foreach ($csvPaths as $csvPath) {
-                CsvPathOption::assertUsable($csvPath, CsvColumns::EXPECTED_HEADER);
+                CsvPathOption::assertUsable($csvPath, CsvColumns::EXPECTED_HEADER, CsvColumns::normalizeHeader(...));
             }
         } catch (Throwable $e) {
             $io->error($e->getMessage());

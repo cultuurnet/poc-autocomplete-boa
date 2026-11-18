@@ -70,9 +70,10 @@ final class CsvPathOption
      * they are both CSVs of Belgian places and neither would obviously
      * misbehave on the other's columns.
      *
-     * @param list<string> $expectedHeader
+     * @param list<string>                                         $expectedHeader
+     * @param (callable(list<string|null>): list<string|null>)|null $normalizeHeader applied to the file's header before comparing
      */
-    public static function assertUsable(string $path, array $expectedHeader): void
+    public static function assertUsable(string $path, array $expectedHeader, ?callable $normalizeHeader = null): void
     {
         if (!file_exists($path)) {
             throw new RuntimeException(sprintf(
@@ -103,7 +104,7 @@ final class CsvPathOption
             throw new RuntimeException(sprintf('CSV file is empty: %s', $path));
         }
 
-        if ($header !== $expectedHeader) {
+        if (($normalizeHeader === null ? $header : $normalizeHeader($header)) !== $expectedHeader) {
             throw new RuntimeException(sprintf(
                 "%s does not have the expected header, so its columns cannot be trusted.\n"
                 . "expected: %s\n"

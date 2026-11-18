@@ -502,7 +502,7 @@ final class DocumentSource implements DocumentSourceInterface
 
         $header = fgetcsv($handle, 0, ',', '"', '');
 
-        if ($header !== CsvColumns::EXPECTED_HEADER) {
+        if ($header === false || CsvColumns::normalizeHeader($header) !== CsvColumns::EXPECTED_HEADER) {
             fclose($handle);
 
             throw new RuntimeException(
